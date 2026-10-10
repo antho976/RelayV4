@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 293,
+  "op_count": 302,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -5687,6 +5687,172 @@
       },
       "result": {
         "$ref": "#/$defs/ArbiterProposal"
+      }
+    },
+    "gym.summary": {
+      "summary": "The Avex overview: when the history was exported, totals, this week and the twelve before, the streak, recent workouts, records, the lifts done most and open goals",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/GymSummary"
+      }
+    },
+    "gym.sessions": {
+      "summary": "Workouts, newest first, each with its lifts, sets, volume and records",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/GymSessionsIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GymSessionsOut"
+      }
+    },
+    "gym.session.get": {
+      "summary": "One workout: every exercise and set, with each set's estimated one-rep max, and the journal",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/GymIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GymSession"
+      }
+    },
+    "gym.lifts": {
+      "summary": "Every lift, done most first: how often, its best set, and its last four weeks beside the four before",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/GymLiftsIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GymLiftsOut"
+      }
+    },
+    "gym.lift.get": {
+      "summary": "One lift's history: each session's heaviest set, estimated one-rep max, sets and volume, records marked",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/GymLiftIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GymLift"
+      }
+    },
+    "gym.cardio": {
+      "summary": "Cardio and rest-day entries, newest first",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/GymCardioIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GymCardioOut"
+      }
+    },
+    "gym.series": {
+      "summary": "A chart's numbers: volume, sessions, sets, minutes, a lift's estimated one-rep max or top weight, cardio minutes or distance, by week, month or session",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/GymSeriesQuery"
+      },
+      "result": {
+        "$ref": "#/$defs/GymSeries"
+      }
+    },
+    "gym.import": {
+      "summary": "Read Avex's training history export (avex_export.json: in Avex, Settings, Export, Training history). It replaces the PC's whole copy",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "gym.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/GymPathIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GymImportOut"
+      }
+    },
+    "gym.reset": {
+      "summary": "Forget the imported Avex history on this PC; Avex itself is untouched",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "gym.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
       }
     }
   },
@@ -21685,6 +21851,1002 @@
       "required": [
         "id",
         "approve"
+      ]
+    },
+    "GymSummary": {
+      "type": "object",
+      "properties": {
+        "imported": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GymImported"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Absent until an export was imported."
+        },
+        "unit": {
+          "type": "string",
+          "description": "`kg` or `lb`."
+        },
+        "totals": {
+          "$ref": "#/$defs/GymTotals"
+        },
+        "this_week": {
+          "$ref": "#/$defs/GymWeek"
+        },
+        "last_week": {
+          "$ref": "#/$defs/GymWeek"
+        },
+        "weeks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymWeek"
+          },
+          "description": "The last 12 weeks, oldest first, this one last."
+        },
+        "streak_weeks": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Weeks in a row with a workout, counting back from this week (or last, while this one is\nstill empty)."
+        },
+        "days_since_last": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "recent": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymSessionRow"
+          },
+          "description": "The newest five."
+        },
+        "records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymRecord"
+          },
+          "description": "The newest eight lifts Avex marked as records, each with its best set that day."
+        },
+        "lifts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymLiftRow"
+          },
+          "description": "The lifts done most in the last 12 weeks (all time when none were)."
+        },
+        "goals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymGoalRow"
+          },
+          "description": "Goals neither met nor archived."
+        }
+      },
+      "required": [
+        "unit",
+        "totals",
+        "this_week",
+        "last_week",
+        "weeks",
+        "streak_weeks",
+        "recent",
+        "records",
+        "lifts",
+        "goals"
+      ]
+    },
+    "GymImported": {
+      "type": "object",
+      "properties": {
+        "exported_at": {
+          "type": "string",
+          "description": "As Avex wrote it: the phone's local date and time."
+        },
+        "imported_at": {
+          "type": "string",
+          "description": "RFC 3339, when the PC read it."
+        },
+        "app_version": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "user_name": {
+          "type": "string"
+        },
+        "days_per_week": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Avex's training days a week, 0 when unset."
+        }
+      },
+      "required": [
+        "exported_at",
+        "imported_at",
+        "app_version",
+        "file",
+        "user_name",
+        "days_per_week"
+      ]
+    },
+    "GymTotals": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sets": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "volume": {
+          "type": "number",
+          "format": "double"
+        },
+        "cardio": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cardio_minutes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "first_day": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_day": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessions",
+        "sets",
+        "volume",
+        "cardio",
+        "cardio_minutes"
+      ]
+    },
+    "GymWeek": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "string",
+          "description": "Its first day, `YYYY-MM-DD`."
+        },
+        "sessions": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sets": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "volume": {
+          "type": "number",
+          "format": "double"
+        },
+        "active_minutes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "cardio_minutes": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "start",
+        "sessions",
+        "sets",
+        "volume",
+        "active_minutes",
+        "cardio_minutes"
+      ],
+      "description": "One week (or month) of training."
+    },
+    "GymSessionRow": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Avex's id for the session."
+        },
+        "day": {
+          "type": "string"
+        },
+        "time": {
+          "type": "string",
+          "description": "`HH:MM`, the PC's zone."
+        },
+        "title": {
+          "type": "string",
+          "description": "The program day (`Push A`), or `Freestyle`."
+        },
+        "session_type": {
+          "type": "string"
+        },
+        "minutes": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Minutes actually training."
+        },
+        "lifts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The lifts done, in order; skipped ones left out."
+        },
+        "skipped": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sets": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "volume": {
+          "type": "number",
+          "format": "double"
+        },
+        "prs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "mood": {
+          "type": "string"
+        },
+        "untracked": {
+          "type": "boolean",
+          "description": "Excluded from Avex's stats, and from every total here."
+        }
+      },
+      "required": [
+        "id",
+        "day",
+        "time",
+        "title",
+        "session_type",
+        "minutes",
+        "lifts",
+        "skipped",
+        "sets",
+        "volume",
+        "prs",
+        "mood",
+        "untracked"
+      ]
+    },
+    "GymRecord": {
+      "type": "object",
+      "properties": {
+        "lift": {
+          "type": "string"
+        },
+        "day": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "weight": {
+          "type": "number",
+          "format": "double"
+        },
+        "reps": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "e1rm": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "lift",
+        "day",
+        "session_id",
+        "weight",
+        "reps"
+      ],
+      "description": "A lift's best set: by estimated one-rep max, the heavier on a tie."
+    },
+    "GymLiftRow": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "sessions": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sets": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "last_day": {
+          "type": "string"
+        },
+        "best": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GymRecord"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The best set ever, by estimated one-rep max."
+        },
+        "recent_e1rm": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "The best estimated one-rep max of the last 28 days."
+        },
+        "change_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "That beside the best of the 28 days before, in percent."
+        }
+      },
+      "required": [
+        "name",
+        "sessions",
+        "sets",
+        "last_day"
+      ]
+    },
+    "GymGoalRow": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "target_key": {
+          "type": "string",
+          "description": "What it is about: a lift's id, a measure."
+        },
+        "target_value": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "As Avex stores it (pounds for a weight)."
+        },
+        "created_day": {
+          "type": "string"
+        },
+        "completed_day": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "target_key",
+        "created_day",
+        "source",
+        "note"
+      ]
+    },
+    "GymSessionsIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Skip this many, newest first."
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "At most this many; 50 by default, 500 at most."
+        },
+        "lift": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only workouts with this lift (a unique part of its name is enough)."
+        }
+      }
+    },
+    "GymSessionsOut": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymSessionRow"
+          }
+        },
+        "total": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many match in all."
+        }
+      },
+      "required": [
+        "sessions",
+        "total"
+      ]
+    },
+    "GymIdIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The session's id, as the lists give it."
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "GymSession": {
+      "type": "object",
+      "properties": {
+        "row": {
+          "$ref": "#/$defs/GymSessionRow"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string",
+          "description": "RFC 3339."
+        },
+        "finished_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "journal": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "string"
+        },
+        "intensity": {
+          "type": "string"
+        },
+        "exercises": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymExercise"
+          }
+        }
+      },
+      "required": [
+        "row",
+        "unit",
+        "started_at",
+        "journal",
+        "tags",
+        "intensity",
+        "exercises"
+      ]
+    },
+    "GymExercise": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "skipped": {
+          "type": "boolean"
+        },
+        "was_pr": {
+          "type": "boolean",
+          "description": "Avex marked a personal record on it."
+        },
+        "difficulty": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "superset": {
+          "type": "string"
+        },
+        "volume": {
+          "type": "number",
+          "format": "double"
+        },
+        "best_e1rm": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "sets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymSet"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "skipped",
+        "was_pr",
+        "difficulty",
+        "note",
+        "superset",
+        "volume",
+        "sets"
+      ]
+    },
+    "GymSet": {
+      "type": "object",
+      "properties": {
+        "weight": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "Absent for a bodyweight set."
+        },
+        "reps": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "rpe": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "kind": {
+          "type": "string",
+          "description": "`work`, `warmup`, or Avex's own name for another kind (`drop`…)."
+        },
+        "e1rm": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "best": {
+          "type": "boolean",
+          "description": "The exercise's best set by estimated one-rep max."
+        },
+        "amrap": {
+          "type": "boolean"
+        },
+        "to_failure": {
+          "type": "boolean"
+        },
+        "assisted": {
+          "type": "boolean"
+        },
+        "seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "reps",
+        "kind",
+        "best",
+        "amrap",
+        "to_failure",
+        "assisted"
+      ]
+    },
+    "GymLiftsIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only lifts whose name contains this."
+        }
+      }
+    },
+    "GymLiftsOut": {
+      "type": "object",
+      "properties": {
+        "unit": {
+          "type": "string"
+        },
+        "lifts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymLiftRow"
+          }
+        }
+      },
+      "required": [
+        "unit",
+        "lifts"
+      ]
+    },
+    "GymLiftIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The lift's name as Avex shows it; a unique part of it is enough."
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "At most this many sessions, newest first; 100 by default."
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "GymLift": {
+      "type": "object",
+      "properties": {
+        "row": {
+          "$ref": "#/$defs/GymLiftRow"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymLiftPoint"
+          },
+          "description": "Newest first."
+        }
+      },
+      "required": [
+        "row",
+        "unit",
+        "history"
+      ]
+    },
+    "GymLiftPoint": {
+      "type": "object",
+      "properties": {
+        "day": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "top_weight": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "The heaviest working set's weight and its reps."
+        },
+        "top_reps": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "e1rm": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "sets": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "volume": {
+          "type": "number",
+          "format": "double"
+        },
+        "record": {
+          "type": "boolean",
+          "description": "Its e1rm beat every earlier session's."
+        }
+      },
+      "required": [
+        "day",
+        "session_id",
+        "top_reps",
+        "sets",
+        "volume",
+        "record"
+      ]
+    },
+    "GymCardioIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "At most this many, newest first; 50 by default."
+        }
+      }
+    },
+    "GymCardioOut": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymCardioRow"
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ]
+    },
+    "GymCardioRow": {
+      "type": "object",
+      "properties": {
+        "day": {
+          "type": "string"
+        },
+        "time": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Avex's name for it: `run`, `bike`, `rest`…"
+        },
+        "minutes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "distance_km": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "effort": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "day",
+        "time",
+        "kind",
+        "minutes",
+        "effort",
+        "note"
+      ]
+    },
+    "GymSeriesQuery": {
+      "type": "object",
+      "properties": {
+        "measure": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "`volume` (default), `sessions`, `sets`, `minutes`, `e1rm`, `top_weight`, `cardio_minutes`\nor `distance`. `e1rm` and `top_weight` need a `lift`."
+        },
+        "by": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "`week` (default), `month`, or `session` (one point per session; with a `lift`, each session\nit was done in)."
+        },
+        "periods": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many weeks or months end at the current one; for `session`, how many weeks back. 12 by\ndefault, at most 260."
+        },
+        "lift": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A lift by name, as Avex shows it; a unique part of the name is enough."
+        }
+      },
+      "description": "What [`series`] reads. Every field is optional."
+    },
+    "GymSeries": {
+      "type": "object",
+      "properties": {
+        "measure": {
+          "type": "string"
+        },
+        "by": {
+          "type": "string"
+        },
+        "lift": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The lift's name as Avex shows it, when one was asked for."
+        },
+        "unit": {
+          "type": "string",
+          "description": "What the values are in: `kg`, `lb`, `sessions`, `sets`, `minutes` or `km`."
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Short captions: `Oct 6`, `Oct`."
+        },
+        "days": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Each label's first day, `YYYY-MM-DD`."
+        },
+        "series": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GymLine"
+          }
+        }
+      },
+      "required": [
+        "measure",
+        "by",
+        "unit",
+        "labels",
+        "days",
+        "series"
+      ]
+    },
+    "GymLine": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "description": "One per label; null where there is nothing to read (a week without that lift)."
+        }
+      },
+      "required": [
+        "name",
+        "values"
+      ]
+    },
+    "GymPathIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "An absolute path on the PC."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "GymImportOut": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sets": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cardio": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "goals": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "exported_at": {
+          "type": "string",
+          "description": "As Avex wrote it: the phone's local date and time."
+        }
+      },
+      "required": [
+        "sessions",
+        "sets",
+        "cardio",
+        "goals",
+        "exported_at"
       ]
     }
   }

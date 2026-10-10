@@ -1,0 +1,20 @@
+[package]
+name = "relay-gym"
+description = "Avex's training history in the Threads space (docs/GYM.md): its JSON export read into a history, the readings Relay shows and its agents ask for, and the SQLite copy kept beside the store behind the `store` feature."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+jiff.workspace = true
+rusqlite = { workspace = true, optional = true }
+
+[features]
+default = ["store"]
+# The SQLite copy (`gym.db`). Off for crates that only need the gym.* contract (relay-bus).
+store = ["dep:rusqlite"]

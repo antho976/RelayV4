@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 /// Arbiter's reads and backtests, its proposals, the kill switch, and orders — which pass the
 /// same risk gate as a rule's and are placed only for a strategy the person lets the AI trade
 /// (docs/ARBITER.md). Keys, strategy edits, limits, restarts and approvals stay the person's.
+/// Avex's training history is read only (docs/GYM.md): importing and forgetting it are the person's.
 pub const AGENT_OPS: &[&str] = &[
     "bus.schema",
     "money.summary",
@@ -59,6 +60,13 @@ pub const AGENT_OPS: &[&str] = &[
     "arbiter.propose",
     "arbiter.order.place",
     "arbiter.halt",
+    "gym.summary",
+    "gym.sessions",
+    "gym.session.get",
+    "gym.lifts",
+    "gym.lift.get",
+    "gym.cardio",
+    "gym.series",
 ];
 
 /// Whether a process in a thread agent's tree may call `op` as the person (`peer::Peer::Thread`):
@@ -179,7 +187,26 @@ limits, save strategies or approve anything.
 
 To chart a product, write a `chart` block with `type` `price`, a `title`, and `arbiter`: {\"product\", \
 \"granularity\" (ONE_HOUR, ONE_DAY…), \"bars\", optional \"strategy_id\" to mark its trades}. Add \
-`cutoff`: your training cutoff as YYYY-MM-DD, and Relay marks where your memory of the market ends.";
+`cutoff`: your training cutoff as YYYY-MM-DD, and Relay marks where your memory of the market ends.
+
+They also have Avex (gym.*), their gym app on the phone. Avex has no internet permission, so Relay \
+holds a read-only copy of its training history from the last export the person imported: anything \
+logged since is not here. Read gym.summary first. When `imported` is absent, nothing has been \
+imported yet: tell them to export it in Avex (Settings → Export → Training history, JSON), copy \
+avex_export.json to this computer, and import it on the Avex page's Data tab. When `exported_at` is \
+more than a few days before today, say how old the copy is before answering about recent training. \
+Weights and volumes are in `unit` (kg or lb). gym.lifts and gym.lift.get give each lift's best set \
+and history, gym.sessions and gym.session.get the workouts and their sets, gym.cardio the cardio; \
+untracked workouts are ones the person excluded in Avex and count toward nothing. `e1rm` is an \
+estimated one-rep max (Epley, from sets of 1 to 12 reps): always call it estimated. You cannot \
+change Avex's data; that happens in Avex on the phone. You are not a doctor: for pain or an injury, \
+say to see a professional rather than programming around it.
+
+To chart training, write a `chart` block with `gym` instead of `query`: a gym.series payload \
+(`measure`: volume, sessions, sets, minutes, e1rm, top_weight, cardio_minutes or distance; `by`: \
+week, month or session; `periods`: how many weeks or months; `lift` by name, needed for e1rm and \
+top_weight). Use a line for a lift's progress and bars for volume or sessions by week. Example:\n\
+```chart\n{\"type\": \"line\", \"title\": \"Bench press, estimated max\", \"gym\": {\"measure\": \"e1rm\", \"lift\": \"Bench Press\", \"by\": \"week\", \"periods\": 16}}\n```\n";
 
 /// The efforts a thread's agent may be given, as `claude --effort` takes them.
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -907,5 +934,19 @@ mod tests {
             assert!(PROMPT.contains(op) && AGENT_OPS.contains(&op), "{op}");
         }
         assert!(!AGENT_OPS.iter().any(|op| op.starts_with("money.fx") || *op == "money.invest.import" || *op == "money.invest.delete"));
+        // Avex's history is read only to an agent, and its chart example is one the thread draws.
+        for op in ["gym.summary", "gym.lifts", "gym.lift.get", "gym.sessions", "gym.session.get", "gym.series"] {
+            assert!(PROMPT.contains(op) && AGENT_OPS.contains(&op), "{op}");
+        }
+        assert!(!AGENT_OPS.iter().any(|op| *op == "gym.import" || *op == "gym.reset"));
+        let gym = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Code { lang, text } if lang == "chart" => chart_spec(text),
+                _ => None,
+            })
+            .find(|c| c.gym.is_some())
+            .expect("a gym chart example");
+        assert_eq!(gym.gym.unwrap()["measure"], "e1rm");
     }
 }

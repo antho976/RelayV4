@@ -525,6 +525,8 @@ pub struct Engine {
     /// Arbiter's desk: its book (`arbiter.db`, opened on first use), the exchange and the lock
     /// orders are placed under.
     pub(crate) arbiter: crate::arbiter::Desk,
+    /// Avex's training history (`gym.db`, opened on first use) and its loaded copy.
+    pub(crate) gym: crate::gym::Shelf,
 }
 
 impl Engine {
@@ -567,6 +569,7 @@ impl Engine {
                 money: Default::default(),
                 threads: Default::default(),
                 arbiter: Default::default(),
+                gym: Default::default(),
             };
             crate::handlers::register_all(&mut engine);
             engine

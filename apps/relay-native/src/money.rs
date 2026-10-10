@@ -27,6 +27,8 @@ pub(crate) mod threads;
 mod chart;
 #[path = "arbiter_pages.rs"]
 mod arbiter;
+#[path = "avex_pages.rs"]
+mod avex;
 
 /// Tally's pages, in tab order: (stack name, caption, glyph).
 pub const PAGES: [(&str, &str, &str); 5] = [
@@ -77,7 +79,7 @@ thread_local! {
 }
 
 pub fn is_page(page: &str) -> bool {
-    page == threads::PAGE || page.starts_with("money-") || page.starts_with("arbiter-")
+    page == threads::PAGE || page.starts_with("money-") || page.starts_with("arbiter-") || page.starts_with("avex-")
 }
 
 /// Whether the Money space is the one showing.
@@ -169,12 +171,13 @@ pub fn sidebar_keys() -> gtk::Box {
     nav
 }
 
-/// Money's pages, added to the window's content stack: the threads, Tally's and Arbiter's.
+/// Money's pages, added to the window's content stack: the threads, Tally's, Arbiter's and Avex's.
 pub fn add_pages(content: &gtk::Stack) {
     content.add_named(&threads::page(), Some(threads::PAGE));
     let tally = PAGES.iter().map(|(name, _, _)| (*name, tally_tabs(name)));
     let arbiter = arbiter::ALL.iter().map(|name| (*name, arbiter::tabs(name)));
-    for (name, tabs) in tally.chain(arbiter) {
+    let avex = avex::ALL.iter().map(|name| (*name, avex::tabs(name)));
+    for (name, tabs) in tally.chain(arbiter).chain(avex) {
         let head = gtk::Box::new(gtk::Orientation::Vertical, 4);
         head.add_css_class("money-head");
         let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
@@ -361,7 +364,21 @@ pub fn install(ui: &Rc<Ui>, nav: &gtk::Box, add: &gtk::Button, dev_only: Vec<gtk
         }
     });
     nav.append(&arbiter_key);
-    let keys = [(tally_key.downgrade(), "money-"), (arbiter_key.downgrade(), "arbiter-")];
+    // Avex, the gym app: its training history as last exported from the phone.
+    let avex_key = button("", "nav");
+    avex_key.set_widget_name("nav-avex-home");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+    row.append(&avex::icon("avex", 16));
+    row.append(&label("Avex", "nav-label"));
+    avex_key.set_child(Some(&row));
+    let weak = Rc::downgrade(ui);
+    avex_key.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.navigate("avex-home");
+        }
+    });
+    nav.append(&avex_key);
+    let keys = [(tally_key.downgrade(), "money-"), (arbiter_key.downgrade(), "arbiter-"), (avex_key.downgrade(), "avex-")];
     ui.content.connect_visible_child_name_notify(move |stack| {
         let showing = stack.visible_child_name();
         for (key, prefix) in &keys {
@@ -383,6 +400,7 @@ pub fn install(ui: &Rc<Ui>, nav: &gtk::Box, add: &gtk::Button, dev_only: Vec<gtk
     });
     pages::install(ui);
     arbiter::install();
+    avex::install();
 }
 
 /// Shows `money`'s keys and look. Navigation calls it through [`follow`].
@@ -488,6 +506,8 @@ pub async fn refresh(ui: &Rc<Ui>, page: &str) {
         threads::refresh_list(ui);
         if page.starts_with("arbiter-") {
             arbiter::refresh(ui, page).await;
+        } else if page.starts_with("avex-") {
+            avex::refresh(ui, page).await;
         } else {
             pages::refresh(ui, page).await;
         }
@@ -528,6 +548,18 @@ pub fn arbiter_changed(ui: &Rc<Ui>) {
     });
 }
 
+/// `gym.changed`: a newer Avex export came in, or the copy was forgotten. The panel, the thread's
+/// training charts and the Avex page showing read again.
+pub fn gym_changed(ui: &Rc<Ui>) {
+    let page = ui.page.borrow().clone();
+    chart::refresh_gym();
+    if page == threads::PAGE {
+        threads::refresh_avex_panel(ui);
+    } else if page.starts_with("avex-") {
+        ui.refresh_page();
+    }
+}
+
 /// A Tally glyph, for the Threads page's own marks.
 pub(crate) fn pages_glyph(key: &str, size: i32) -> gtk::Image {
     pages::glyph_image(key, size)
@@ -557,6 +589,10 @@ pub fn palette_entries() -> Vec<(&'static str, String)> {
     for (name, caption) in arbiter::PAGES {
         entries.push((name, format!("Arbiter {}", caption.to_lowercase())));
     }
+    for (name, caption) in avex::PAGES {
+        entries.push((name, format!("Avex {}", caption.to_lowercase())));
+    }
+    entries.push(("avex-import", String::from("Avex: import training history")));
     // The kill switch, from anywhere (docs/ARBITER.md).
     entries.push(("arbiter-halt", String::from("Arbiter: halt all")));
     entries
@@ -569,6 +605,7 @@ pub fn run_palette(ui: &Rc<Ui>, key: &str) {
         "thread" => threads::new_thread(ui),
         "add" => add_entry(ui),
         "arbiter-halt" => arbiter::halt_all(ui),
+        "avex-import" => avex::import(ui),
         page => ui.navigate(page),
     }
 }

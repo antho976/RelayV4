@@ -231,6 +231,13 @@ pub fn tool_caption(name: &str) -> String {
         "money.invest.summary" => "Read your investments".into(),
         "money.invest.list" => "Listed investment activity".into(),
         "money.invest.add" => "Recorded an investment activity".into(),
+        "gym.summary" => "Read your training".into(),
+        "gym.sessions" => "Listed workouts".into(),
+        "gym.session.get" => "Read a workout".into(),
+        "gym.lifts" => "Read your lifts".into(),
+        "gym.lift.get" => "Read a lift's history".into(),
+        "gym.cardio" => "Read cardio".into(),
+        "gym.series" => "Added up training".into(),
         "bus.schema" => "Checked how a tool works".into(),
         "" => format!("Used {name}"),
         other => format!("Used {other}"),
@@ -272,14 +279,16 @@ pub enum ChartKind {
     Donut,
 }
 
-/// A ```` ```chart ```` block: what to draw and the question its numbers come from (`money.series`),
-/// or, failing a question, numbers written in it.
+/// A ```` ```chart ```` block: what to draw and the question its numbers come from (`money.series`,
+/// or `gym.series` for Avex's history), or, failing a question, numbers written in it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChartSpec {
     pub kind: ChartKind,
     pub title: String,
     /// A `money.series` payload.
     pub query: Option<serde_json::Value>,
+    /// A `gym.series` payload: Avex's training history instead of the ledger.
+    pub gym: Option<serde_json::Value>,
     /// `{"labels", "series": [{"name", "values"}]}`, minor units, when there is no query.
     pub data: Option<serde_json::Value>,
 }
@@ -294,11 +303,12 @@ pub fn chart_spec(text: &str) -> Option<ChartSpec> {
         _ => return None,
     };
     let query = v.get("query").filter(|q| q.is_object()).cloned();
+    let gym = v.get("gym").filter(|q| q.is_object()).cloned();
     let data = v.get("data").filter(|d| d["labels"].is_array() && d["series"].is_array()).cloned();
-    if query.is_none() && data.is_none() {
+    if query.is_none() && gym.is_none() && data.is_none() {
         return None;
     }
-    Some(ChartSpec { kind, title: v["title"].as_str().unwrap_or("").to_string(), query, data })
+    Some(ChartSpec { kind, title: v["title"].as_str().unwrap_or("").to_string(), query, gym, data })
 }
 
 /// Round axis steps for values up to `max` (minor units, `digits` fraction digits): the step, and
@@ -352,6 +362,9 @@ mod tests {
         assert_eq!(spec.query.unwrap()["by"], "day");
         let fixed = chart_spec(r#"{"type":"pie","data":{"labels":["A"],"series":[{"name":"x","values":[5]}]}}"#).unwrap();
         assert_eq!(fixed.kind, ChartKind::Donut);
+        let lift = chart_spec(r#"{"type":"line","title":"Bench","gym":{"measure":"e1rm","lift":"bench"}}"#).unwrap();
+        assert_eq!(lift.gym.unwrap()["lift"], "bench");
+        assert!(lift.query.is_none());
         assert!(chart_spec(r#"{"type":"radar","query":{}}"#).is_none());
         assert!(chart_spec(r#"{"type":"bar"}"#).is_none(), "no question and no numbers");
         assert!(chart_spec("not json").is_none());
@@ -380,6 +393,7 @@ mod tests {
         assert_eq!(tool_caption("mcp__relay__money_invest_summary"), "Read your investments");
         assert_eq!(tool_caption("mcp__relay__money_invest_list"), "Listed investment activity");
         assert_eq!(tool_caption("mcp__relay__money_invest_add"), "Recorded an investment activity");
+        assert_eq!(tool_caption("mcp__relay__gym_lift_get"), "Read a lift's history");
         assert!(tool_writes("mcp__relay__money_invest_add"));
         assert!(!tool_writes("mcp__relay__money_invest_summary") && !tool_writes("mcp__relay__money_invest_list"));
     }

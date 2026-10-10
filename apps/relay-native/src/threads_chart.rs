@@ -8,6 +8,11 @@
 //! Colour is the data's: the newest period in Relay's signal, the ones before it in a fixed
 //! palette, and categories in their own hue.
 //!
+//! A chart with `gym` instead of `query` asks `gym.series` (Avex's training history, docs/GYM.md):
+//! its values are weights, counts or minutes, shown in the unit the reading names, and a lift's
+//! line starts its axis near its lowest value so progress shows. It reads again on every
+//! `gym.changed` (`refresh_gym`).
+//!
 //! A `price` chart is Arbiter's: `{"type": "price", "title", "arbiter": <an arbiter.series
 //! payload>, "cutoff": "2025-03-01"}`. It draws the closes, a strategy's buys (filled green) and
 //! sells (hollow), and, given `cutoff`, where the model's memory ends: what it may remember is
@@ -36,12 +41,16 @@ const AXIS_W: i32 = 56;
 type Live = (glib::WeakRef<gtk::Box>, glib::WeakRef<gtk::Box>, ChartSpec, Rc<Cell<bool>>);
 /// A price chart on screen: its body, its legend and what it asks Arbiter.
 type PriceLive = (glib::WeakRef<gtk::Box>, glib::WeakRef<gtk::Box>, PriceSpec);
+/// A training chart on screen: its body, its legend and what it asks Avex's history.
+type GymLive = (glib::WeakRef<gtk::Box>, glib::WeakRef<gtk::Box>, ChartSpec);
 
 thread_local! {
     /// Charts drawn from a question, to read again when the ledger moves.
     static LIVE: RefCell<Vec<Live>> = const { RefCell::new(Vec::new()) };
     /// Price charts, to read again when Arbiter moves.
     static PRICES: RefCell<Vec<PriceLive>> = const { RefCell::new(Vec::new()) };
+    /// Training charts, to read again when a newer Avex export comes in.
+    static GYM: RefCell<Vec<GymLive>> = const { RefCell::new(Vec::new()) };
 }
 
 fn rgb(hex: &str) -> (f64, f64, f64) {
@@ -88,11 +97,18 @@ pub fn card(spec: ChartSpec) -> gtk::Box {
     head.append(&legend);
     card.append(&head);
     let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    body.append(&label("Reading the ledger…", "threads-chart-note"));
+    body.append(&label(if spec.gym.is_some() { "Reading Avex…" } else { "Reading the ledger…" }, "threads-chart-note"));
     card.append(&body);
     let foot = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     foot.add_css_class("threads-chart-foot");
-    if spec.query.is_some() {
+    if spec.gym.is_some() {
+        let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        lamp.add_css_class("threads-dot");
+        lamp.set_valign(gtk::Align::Center);
+        foot.append(&lamp);
+        foot.append(&label("From Avex's last export, redraws when a newer one comes in", "threads-chart-note"));
+        GYM.with(|l| l.borrow_mut().push((body.downgrade(), legend.downgrade(), spec.clone())));
+    } else if spec.query.is_some() {
         let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         lamp.add_css_class("threads-dot");
         lamp.set_valign(gtk::Align::Center);
@@ -123,6 +139,18 @@ pub fn refresh_all() {
         } else {
             stale.set(true);
         }
+    }
+}
+
+/// A newer Avex export came in, or the copy was forgotten: read every training chart again.
+pub fn refresh_gym() {
+    let live: Vec<_> = GYM.with(|l| {
+        let mut l = l.borrow_mut();
+        l.retain(|(body, _, _)| body.upgrade().is_some());
+        l.iter().filter_map(|(b, g, s)| Some((b.upgrade()?, g.upgrade()?, s.clone()))).collect()
+    });
+    for (body, legend, spec) in live {
+        load(&body, &legend, &spec);
     }
 }
 
@@ -166,6 +194,24 @@ fn load(body: &gtk::Box, legend: &gtk::Box, spec: &ChartSpec) {
         draw(body, legend, spec.kind, &data);
         return;
     }
+    if let Some(query) = spec.gym.clone() {
+        let Some(ui) = super::threads::the_ui_pub() else { return };
+        let (body, legend, kind) = (body.downgrade(), legend.downgrade(), spec.kind);
+        glib::spawn_future_local(async move {
+            let read = ui.call("gym.series", query).await;
+            let (Some(body), Some(legend)) = (body.upgrade(), legend.upgrade()) else { return };
+            match read {
+                Ok(series) => draw_data(&body, &legend, kind, read_gym(&series, kind)),
+                Err(e) => {
+                    clear(&body);
+                    let note = label(&format!("This chart could not be read: {}", super::avex::said(&e)), "threads-error");
+                    note.set_wrap(true);
+                    body.append(&note);
+                }
+            }
+        });
+        return;
+    }
     let Some(query) = spec.query.clone() else { return };
     let Some(ui) = super::threads::the_ui_pub() else { return };
     let (body, legend, kind) = (body.downgrade(), legend.downgrade(), spec.kind);
@@ -190,7 +236,74 @@ struct Data {
     series: Vec<(String, Vec<i64>)>,
     /// How many labels each series has reached (the period still running), else all of them.
     known: Vec<usize>,
-    fmt: MoneyFormatter,
+    fmt: Fmt,
+    /// The value axis starts at zero; a lift's line starts near its lowest value instead.
+    from_zero: bool,
+}
+
+/// How a chart's values read: money in minor units, or a training figure in tenths of its unit.
+#[derive(Clone)]
+enum Fmt {
+    Money(MoneyFormatter),
+    Unit(String),
+}
+
+impl Fmt {
+    fn fraction_digits(&self) -> u32 {
+        match self {
+            Fmt::Money(f) => f.fraction_digits,
+            Fmt::Unit(_) => 1,
+        }
+    }
+
+    fn unit_words(unit: &str, tenths: i64, whole: bool) -> String {
+        let v = tenths as f64 / 10.0;
+        let n = if whole || tenths % 10 == 0 { super::avex::group(v.round() as i64) } else { format!("{v:.1}") };
+        match unit {
+            "" => n,
+            "sessions" | "sets" | "minutes" if !whole => format!("{n} {unit}"),
+            "sessions" | "sets" | "minutes" => n,
+            unit => format!("{n} {unit}"),
+        }
+    }
+
+    fn format(&self, v: i64) -> String {
+        match self {
+            Fmt::Money(f) => f.format(v),
+            Fmt::Unit(u) => Fmt::unit_words(u, v, false),
+        }
+    }
+
+    fn format_whole(&self, v: i64) -> String {
+        match self {
+            Fmt::Money(f) => f.format_whole(v),
+            Fmt::Unit(u) => Fmt::unit_words(u, v, true),
+        }
+    }
+}
+
+/// A `gym.series` reading as a chart's numbers, in tenths of its unit. A lift's best has nothing
+/// to read in a week it was not done: such points are left out rather than drawn at zero.
+fn read_gym(v: &Value, kind: ChartKind) -> Data {
+    let labels: Vec<String> = v["labels"].as_array().into_iter().flatten().map(|l| l.as_str().unwrap_or("").to_string()).collect();
+    let lines: Vec<(String, Vec<Option<f64>>)> = v["series"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|s| (s["name"].as_str().unwrap_or("").to_string(), (0..labels.len()).map(|i| s["values"][i].as_f64()).collect()))
+        .collect();
+    let keep: Vec<usize> = (0..labels.len()).filter(|i| lines.iter().any(|(_, values)| values[*i].is_some())).collect();
+    let series = lines.into_iter().map(|(name, values)| (name, keep.iter().map(|i| (values[*i].unwrap_or(0.0) * 10.0).round() as i64).collect())).collect();
+    let labels: Vec<String> = keep.iter().map(|i| labels[*i].clone()).collect();
+    let measure = v["measure"].as_str().unwrap_or("");
+    Data {
+        known: vec![labels.len(); 1],
+        colors: vec![None; labels.len()],
+        labels,
+        series,
+        fmt: Fmt::Unit(v["unit"].as_str().unwrap_or("").to_string()),
+        from_zero: !(kind == ChartKind::Line && matches!(measure, "e1rm" | "top_weight")),
+    }
 }
 
 fn read(v: &Value) -> Data {
@@ -212,13 +325,16 @@ fn read(v: &Value) -> Data {
         .map(|s| s["known"].as_u64().map_or(labels.len(), |k| (k as usize).min(labels.len())))
         .collect();
     let currency = v["currency"].as_str().filter(|c| !c.is_empty()).unwrap_or("CAD");
-    Data { labels, colors, series, known, fmt: MoneyFormatter::new(currency, Locale::from_env()) }
+    Data { labels, colors, series, known, fmt: Fmt::Money(MoneyFormatter::new(currency, Locale::from_env())), from_zero: true }
 }
 
 fn draw(body: &gtk::Box, legend: &gtk::Box, kind: ChartKind, v: &Value) {
+    draw_data(body, legend, kind, read(v));
+}
+
+fn draw_data(body: &gtk::Box, legend: &gtk::Box, kind: ChartKind, data: Data) {
     clear(body);
     clear(legend);
-    let data = read(v);
     if data.labels.is_empty() || data.series.iter().all(|(_, values)| values.iter().all(|x| *x == 0)) {
         body.append(&label("Nothing to draw yet: no entries match.", "threads-chart-note"));
         return;
@@ -244,10 +360,18 @@ fn draw(body: &gtk::Box, legend: &gtk::Box, kind: ChartKind, v: &Value) {
 fn plot(body: &gtk::Box, data: &Data, kind: ChartKind) {
     let all = data.series.iter().flat_map(|(_, v)| v.iter().copied());
     let (lo, hi) = all.fold((0_i64, 0_i64), |(lo, hi), x| (lo.min(x), hi.max(x)));
-    let digits = data.fmt.fraction_digits;
-    let (step, up) = ticks(hi.max(-lo), digits);
+    let digits = data.fmt.fraction_digits();
+    // A line that need not start at zero starts a step under its lowest value.
+    let least = data.series.iter().flat_map(|(_, v)| v.iter().copied()).min().unwrap_or(0);
+    let base = if data.from_zero || least <= 0 {
+        0
+    } else {
+        let (step, _) = ticks((hi - least).max(1), digits);
+        (least / step - 1).max(0) * step
+    };
+    let (step, up) = ticks((hi - base).max(-lo), digits);
     let down = if lo < 0 { ((-lo + step - 1) / step) as u32 } else { 0 };
-    let (top, bottom) = (step * i64::from(up), -step * i64::from(down));
+    let (top, bottom) = (base + step * i64::from(up), base - step * i64::from(down));
     let span = (top - bottom).max(1) as f64;
     let y_of = move |value: i64, h: f64| PAD_T + (top - value) as f64 / span * (h - PAD_T - PAD_B);
 
@@ -257,7 +381,7 @@ fn plot(body: &gtk::Box, data: &Data, kind: ChartKind) {
     area.set_hexpand(true);
     overlay.set_child(Some(&area));
     for k in -(down as i64)..=i64::from(up) {
-        let value = k * step;
+        let value = base + k * step;
         let tick = label(&data.fmt.format_whole(value), "threads-chart-axis");
         tick.set_halign(gtk::Align::Start);
         tick.set_valign(gtk::Align::Start);
@@ -278,7 +402,7 @@ fn plot(body: &gtk::Box, data: &Data, kind: ChartKind) {
         let gw = plot_w / groups as f64;
         // Grid: one line per tick, the zero line a step brighter.
         for k in -(down as i64)..=i64::from(up) {
-            let y = y_of(k * step, h).round() + 0.5;
+            let y = y_of(base + k * step, h).round() + 0.5;
             let (r, g, b) = rgb(if k == 0 { "#33302D" } else { "#242220" });
             cr.set_source_rgb(r, g, b);
             cr.set_line_width(1.0);
@@ -286,7 +410,7 @@ fn plot(body: &gtk::Box, data: &Data, kind: ChartKind) {
             cr.line_to(w - 4.0, y);
             let _ = cr.stroke();
         }
-        let zero = y_of(0, h);
+        let zero = y_of(base, h);
         match kind {
             ChartKind::Line => {
                 for (i, (_, values)) in series.iter().enumerate() {

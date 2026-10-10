@@ -2,8 +2,8 @@
 
 Threads replace the Money space. A thread is a conversation with an agent that works on the data
 of Antho's own apps, shown and editable beside it: agent first, data second. Tally's budget is the
-first source and its investments the second; the gym app and an AI investing bot are later and not
-designed here.
+first source and its investments the second; Arbiter, the trading bot, is designed in
+`docs/ARBITER.md`, and Avex, the gym app, read only from its export, in `docs/GYM.md`.
 
 Decided with Antho on 2026-10-07:
 
@@ -207,3 +207,10 @@ Tests: `crates/relay-core/tests/money.rs` imports the shared holdings report (W1
 twice and reads it back, records, undoes and restores an activity, refuses files and the network to
 an agent, and fetches rates from a stand-in `curl`; `crates/relay-remote/tests/remote.rs` carries an
 imported activity from the phone through `money.sync`.
+
+## Avex (2026-10-09)
+
+Avex, the gym app, is the panel's third source, beside Tally and Arbiter: a chip in the message box,
+a switch above the panel (Overview, Workouts, Lifts), a sidebar key and its own pages. It has no
+internet, so Relay reads the training history it exports and keeps it read only; an agent reads
+`gym.*` and charts with a `gym` question instead of `query`. `docs/GYM.md` is the contract.
