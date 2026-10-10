@@ -1,1 +1,0 @@
-ALTER TABLE `instructs` ADD `last_output_prefix` text DEFAULT '' NOT NULL;

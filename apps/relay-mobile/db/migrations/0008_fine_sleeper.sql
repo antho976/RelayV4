@@ -1,1 +1,0 @@
-ALTER TABLE `chat_swipes` ADD `timings` text;

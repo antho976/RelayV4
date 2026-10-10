@@ -8,7 +8,7 @@ AI-planned trades come later and are not designed anywhere yet.
 Decided with Antho on 2026-10-07:
 
 - **Two apps, one repository.** Tally stays its own Android app in `apps/tally` (Kotlin, Compose,
-  Room). `apps/relay-mobile` stays the PC remote. Folding them into one phone app is a later idea,
+  Room). `apps/relay-android` is the PC remote. Folding them into one phone app is a later idea,
   not this plan.
 - **Both devices hold the whole ledger and work as one.** The phone is where nearly everything is
   logged; the PC is used rarely but must never be read-only. Either can add or change anything
@@ -65,7 +65,7 @@ The first sync makes the PC's ledger the phone's; after that both sides merge.
 4. **The desktop Money space.** The space switcher, the start screen, and Money pages that mirror
    Tally's Home, Transactions, Plan and Insights, drawn with Tally's tokens (`apps/tally/DESIGN.md`)
    as Relay's second theme.
-5. **Sync.** Tally pairs with the PC the way `relay-mobile` does (`crates/relay-remote`, LAN or
+5. **Sync.** Tally pairs with the PC the way Relay's phone app does (`crates/relay-remote`, LAN or
    Tailscale; no cloud) and exchanges changes since the last sync. Newest edit wins per row; for one
    person, conflicts are rare. Totals are never synced: balances and pace are recomputed from the
    entries, so equal entries always mean equal numbers. Tally gains the INTERNET permission for
@@ -151,7 +151,7 @@ Clients format amounts themselves with `relay_money::money::MoneyFormatter`
 
 ## Sync
 
-Tally talks to the PC through the same door `relay-mobile` uses (`crates/relay-remote`, wire v1:
+Tally talks to the PC through the same door Relay's phone app uses (`crates/relay-remote`, wire v1:
 greeting, pairing code once, then a proof per connection; docs/MOBILE.md §2, §6). It sends one
 bus request, `money.sync`, which is in `PHONE_OPS`.
 

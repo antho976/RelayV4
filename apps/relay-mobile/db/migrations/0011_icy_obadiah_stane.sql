@@ -1,1 +1,0 @@
-ALTER TABLE `instructs` ADD `use_common_stop` integer DEFAULT true NOT NULL;
