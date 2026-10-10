@@ -87,6 +87,8 @@ fn request_timeout(op: &str) -> Duration {
         "arbiter.backtest" => Duration::from_secs(180),
         // These wait on the exchange: a key's check, a market sell, cancelling every order.
         "arbiter.key.set" | "arbiter.flatten" | "arbiter.halt" | "arbiter.refresh" => Duration::from_secs(60),
+        // Years of training: a file of tens of megabytes, read and written whole.
+        "gym.import" => Duration::from_secs(120),
         _ => Duration::from_secs(30),
     }
 }

@@ -2855,6 +2855,7 @@ name = "relay-bus"
 version = "4.0.0-dev"
 dependencies = [
  "relay-arbiter",
+ "relay-gym",
  "relay-money",
  "schemars",
  "serde",
@@ -2909,6 +2910,7 @@ dependencies = [
  "relay-arbiter",
  "relay-bus",
  "relay-client",
+ "relay-gym",
  "relay-money",
  "rusqlite",
  "rust_decimal",
@@ -2927,6 +2929,17 @@ dependencies = [
  "tree-sitter-typescript",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "relay-gym"
+version = "4.0.0-dev"
+dependencies = [
+ "jiff",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

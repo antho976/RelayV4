@@ -14,6 +14,7 @@ pub mod integration;
 pub mod module;
 pub mod money;
 pub mod arbiter;
+pub mod gym;
 pub mod thread;
 pub mod notes;
 pub mod notify;
@@ -48,6 +49,7 @@ pub fn register_all(e: &mut Engine) {
     ui::register(e);
     money::register(e);
     arbiter::register(e);
+    gym::register(e);
     thread::register(e);
     guardrail::register(e);
 }

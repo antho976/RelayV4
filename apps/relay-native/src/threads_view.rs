@@ -1,5 +1,5 @@
 //! The Threads page: the thread list in the sidebar, the conversation with its message box, and
-//! the panel beside it, Tally's or Arbiter's (docs/THREADS.md, docs/ARBITER.md).
+//! the panel beside it, Tally's, Arbiter's or Avex's (docs/THREADS.md, docs/ARBITER.md, docs/GYM.md).
 //!
 //! Threads are the engine's (`thread.*`); this page draws them and follows `thread.changed`,
 //! `thread.message` and `thread.delta`. The page is one stack page, `threads`, whose middle shows
@@ -56,10 +56,11 @@ const EFFORTS: [(&str, &str); 6] = [
 const PANEL_TABS: [(&str, &str); 4] = [("overview", "Overview"), ("entries", "Entries"), ("budgets", "Budgets"), ("invest", "Invest")];
 
 /// The panel's sources, as the message box's chips name them: (key, caption, what it means).
-/// Choosing one shows its panel; the agent reaches both either way.
-const SOURCES: [(&str, &str, &str); 2] = [
+/// Choosing one shows its panel; the agent reaches all of them either way.
+const SOURCES: [(&str, &str, &str); 3] = [
     ("tally", "Tally", "Show Tally beside the thread: the agent reads and changes your budget and investments"),
     ("arbiter", "Arbiter", "Show Arbiter beside the thread: the agent reads, backtests and proposes; orders follow each strategy's mode"),
+    ("avex", "Avex", "Show Avex beside the thread: the agent reads your training as last exported from the phone"),
 ];
 
 /// The widest the conversation and its message box grow (the mockup's column).
@@ -113,10 +114,12 @@ struct View {
     panel_key: gtk::ToggleButton,
     panel_body: gtk::Box,
     panel_tabs: Vec<(&'static str, gtk::Button)>,
-    /// The two rows of panel tabs, Tally's and Arbiter's, one shown at a time.
+    /// The rows of panel tabs, Tally's, Arbiter's and Avex's, one shown at a time.
     tally_tabs: gtk::Box,
     arbiter_tabs: gtk::Box,
     arbiter_panel_tabs: Vec<(&'static str, gtk::Button)>,
+    avex_tabs: gtk::Box,
+    avex_panel_tabs: Vec<(&'static str, gtk::Button)>,
     /// The source switch above the panel's tabs, and the message box's chips.
     sources: Vec<(&'static str, gtk::Button)>,
     chips: Vec<(&'static str, gtk::Button)>,
@@ -188,9 +191,10 @@ struct State {
     /// Entries this thread added, marked in the panel.
     added: RefCell<HashSet<i64>>,
     panel_tab: Cell<&'static str>,
-    /// The panel's source, `tally` or `arbiter`, and Arbiter's tab.
+    /// The panel's source, `tally`, `arbiter` or `avex`, and Arbiter's and Avex's tabs.
     source: Cell<&'static str>,
     arbiter_tab: Cell<&'static str>,
+    avex_tab: Cell<&'static str>,
     /// Bumped by every panel read: only the newest one draws.
     panel_serial: Cell<u64>,
     /// `None` until the person opens or closes the panel; until then it follows the page width.
@@ -222,8 +226,12 @@ thread_local! {
 /// Remember the window, for the page's own keys: `money::install` calls it.
 pub fn install(ui: &Rc<Ui>) {
     STATE.with(|s| *s.ui.borrow_mut() = Rc::downgrade(ui));
-    // Display smoke runs (RELAY_NATIVE_SCREENSHOT) open a thread by id to capture it.
+    // Display smoke runs (RELAY_NATIVE_SCREENSHOT) open a thread by id to capture it, and show a
+    // panel source by key (RELAY_NATIVE_SOURCE=avex).
     if std::env::var_os("RELAY_NATIVE_SCREENSHOT").is_some() {
+        if let Some(source) = std::env::var("RELAY_NATIVE_SOURCE").ok().and_then(|k| SOURCES.iter().find(|(key, _, _)| *key == k)).map(|(key, _, _)| *key) {
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || set_source(source));
+        }
         if let Some(id) = std::env::var("RELAY_NATIVE_THREAD").ok().and_then(|id| id.parse::<i64>().ok()) {
             let weak = Rc::downgrade(ui);
             glib::timeout_add_local_once(std::time::Duration::from_millis(2600), move || {
@@ -402,7 +410,7 @@ pub fn page() -> gtk::Box {
     field.add_overlay(&hint);
     composer.append(&field);
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    // Tally and Arbiter: which panel shows beside the thread.
+    // Tally, Arbiter or Avex: which panel shows beside the thread.
     let source = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let mut chips = Vec::new();
     for (key, caption, about) in SOURCES {
@@ -481,8 +489,8 @@ pub fn page() -> gtk::Box {
     body.set_resize_start_child(true);
     body.set_shrink_start_child(false);
 
-    // The panel: 340 pixels as it opens, 300 at the least. Its source, Tally or Arbiter, above
-    // that source's tabs.
+    // The panel: 340 pixels as it opens, 300 at the least. Its source, Tally, Arbiter or Avex,
+    // above that source's tabs.
     let side = gtk::Box::new(gtk::Orientation::Vertical, 18);
     side.add_css_class("threads-panel");
     side.set_size_request(300, -1);
@@ -521,6 +529,18 @@ pub fn page() -> gtk::Box {
         arbiter_panel_tabs.push((key, tab));
     }
     side.append(&arbiter_tabs);
+    let avex_tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    avex_tabs.add_css_class("view-tabs");
+    avex_tabs.set_homogeneous(true);
+    avex_tabs.set_visible(false);
+    let mut avex_panel_tabs = Vec::new();
+    for (key, caption) in super::avex::PANEL_TABS {
+        let tab = button(caption, "quiet");
+        tab.set_widget_name(&format!("threads-panel-{key}"));
+        avex_tabs.append(&tab);
+        avex_panel_tabs.push((key, tab));
+    }
+    side.append(&avex_tabs);
     let panel_body = gtk::Box::new(gtk::Orientation::Vertical, 18);
     let panel_scroll = crate::app::scrolled(&panel_body);
     panel_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -569,12 +589,13 @@ pub fn page() -> gtk::Box {
         title, title_key, rename, middle, empty, empty_slot, empty_line, suggestions, dock, dock_slot, message_box,
         notice, notice_text, input, hint, send: send_key, source, limits, model, effort, scroll, jump, column, pending,
         working, working_text, panel, panel_key, panel_body, panel_tabs,
-        tally_tabs: tabs, arbiter_tabs, arbiter_panel_tabs, sources, chips,
+        tally_tabs: tabs, arbiter_tabs, arbiter_panel_tabs, avex_tabs, avex_panel_tabs, sources, chips,
     });
     STATE.with(|s| {
         s.panel_tab.set("overview");
         s.source.set("tally");
         s.arbiter_tab.set(super::arbiter::PANEL_TABS[0].0);
+        s.avex_tab.set(super::avex::PANEL_TABS[0].0);
         *s.suggested.borrow_mut() = SUGGESTIONS.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
         *s.view.borrow_mut() = Some(built.clone());
     });
@@ -587,8 +608,17 @@ pub fn page() -> gtk::Box {
     root
 }
 
-/// The panel's source switch and the message box's chips, and Arbiter's tabs.
+/// The panel's source switch and the message box's chips, and Arbiter's and Avex's tabs.
 fn wire_sources(v: &Rc<View>) {
+    for (key, tab) in &v.avex_panel_tabs {
+        let key = *key;
+        tab.connect_clicked(move |_| {
+            STATE.with(|s| s.avex_tab.set(key));
+            if let Some(ui) = the_ui() {
+                refresh_panel(&ui);
+            }
+        });
+    }
     for (key, tab) in &v.arbiter_panel_tabs {
         let key = *key;
         tab.connect_clicked(move |_| {
@@ -627,12 +657,15 @@ fn show_source(v: &View) {
             tab.remove_css_class("selected");
         }
     }
-    let arbiter = source == "arbiter";
-    v.tally_tabs.set_visible(!arbiter);
-    v.arbiter_tabs.set_visible(arbiter);
-    if arbiter {
+    v.tally_tabs.set_visible(source == "tally");
+    v.arbiter_tabs.set_visible(source == "arbiter");
+    v.avex_tabs.set_visible(source == "avex");
+    if source == "arbiter" {
         v.limits.set_text("Proposes, you approve");
         v.limits.set_tooltip_text(Some("It reads, backtests and proposes. Orders follow each strategy's mode, always within its limits, and only you change those."));
+    } else if source == "avex" {
+        v.limits.set_text("Reads only");
+        v.limits.set_tooltip_text(Some("It reads your training as last exported from Avex. It cannot change anything in Avex."));
     } else {
         v.limits.set_text("Edits with Undo");
         v.limits.set_tooltip_text(Some("It adds and changes entries and investment activity, each with an Undo. Deleting, budgets and accounts stay yours."));
@@ -2488,15 +2521,58 @@ fn refresh_arbiter(ui: &Rc<Ui>, v: &View) {
     });
 }
 
-/// Re-read the panel's view, Tally's or Arbiter's, if it is open. Only the newest read draws.
+/// `gym.changed`: re-read the panel when it shows Avex.
+pub fn refresh_avex_panel(ui: &Rc<Ui>) {
+    if STATE.with(|s| s.source.get()) == "avex" {
+        refresh_panel(ui);
+    }
+}
+
+/// Re-read Avex's panel view; one source's read never lands on another's panel.
+fn refresh_avex(ui: &Rc<Ui>, v: &View) {
+    let tab = STATE.with(|s| s.avex_tab.get());
+    for (key, button) in &v.avex_panel_tabs {
+        if *key == tab {
+            button.add_css_class("selected");
+        } else {
+            button.remove_css_class("selected");
+        }
+    }
+    let serial = STATE.with(|s| {
+        let next = s.panel_serial.get().wrapping_add(1);
+        s.panel_serial.set(next);
+        next
+    });
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let read = super::avex::panel_read(&ui, tab).await;
+        if STATE.with(|s| s.panel_serial.get() != serial || s.source.get() != "avex" || s.avex_tab.get() != tab) {
+            return;
+        }
+        let Some(v) = view() else { return };
+        clear(&v.panel_body);
+        match read {
+            Ok(value) => super::avex::panel_draw(&ui, &v.panel_body, tab, &value),
+            Err(e) => {
+                let l = label(&super::avex::said(&e), "money-muted");
+                l.set_wrap(true);
+                v.panel_body.append(&l);
+            }
+        }
+    });
+}
+
+/// Re-read the panel's view, Tally's, Arbiter's or Avex's, if it is open. Only the newest read
+/// draws.
 pub fn refresh_panel(ui: &Rc<Ui>) {
     let Some(v) = view() else { return };
     if !v.panel.is_visible() {
         return;
     }
-    if STATE.with(|s| s.source.get()) == "arbiter" {
-        refresh_arbiter(ui, &v);
-        return;
+    match STATE.with(|s| s.source.get()) {
+        "arbiter" => return refresh_arbiter(ui, &v),
+        "avex" => return refresh_avex(ui, &v),
+        _ => {}
     }
     let tab = STATE.with(|s| s.panel_tab.get());
     for (key, button) in &v.panel_tabs {
@@ -2527,7 +2603,7 @@ pub fn refresh_panel(ui: &Rc<Ui>) {
             }
             _ => ui.call("money.summary", json!({})).await,
         };
-        if STATE.with(|s| s.panel_serial.get() != serial || s.panel_tab.get() != tab || s.source.get() == "arbiter") {
+        if STATE.with(|s| s.panel_serial.get() != serial || s.panel_tab.get() != tab || s.source.get() != "tally") {
             return;
         }
         let Some(v) = view() else { return };

@@ -1,0 +1,6 @@
+/* Avex (avex_pages.rs) in the dev space's tokens, beside Tally's and Arbiter's pages: the same
+   cards, strips and rows (money.css, arbiter.css). Lime marks a record, as Relay's signal; the
+   rest is Dev's ink. Backgrounds stay see-through. */
+.tally-row.avex-set { padding-top: 6px; padding-bottom: 6px; }
+.avex-set .arbiter-step-number { min-width: 22px; }
+.avex-set .money-muted { color: @faint; }

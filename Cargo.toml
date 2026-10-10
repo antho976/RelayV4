@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/relay-bus", "crates/relay-core", "crates/relay-cli", "crates/relay-remote", "crates/relay-board", "crates/relay-client", "crates/relay-money", "crates/relay-arbiter", "apps/relay-native"]
+members = ["crates/relay-bus", "crates/relay-core", "crates/relay-cli", "crates/relay-remote", "crates/relay-board", "crates/relay-client", "crates/relay-money", "crates/relay-arbiter", "crates/relay-gym", "apps/relay-native"]
 # Engine checks stay headless; build the GTK client with `-p relay-native`. relay-board and
 # relay-client are the client's GTK-free logic (the board; the Git panel and the device mirror),
 # here so plain `cargo test` (and CI) runs their tests. relay-money is Tally's money rules;
-# relay-arbiter is Arbiter's trading rules.
-default-members = ["crates/relay-bus", "crates/relay-core", "crates/relay-cli", "crates/relay-remote", "crates/relay-board", "crates/relay-client", "crates/relay-money", "crates/relay-arbiter"]
+# relay-arbiter is Arbiter's trading rules; relay-gym reads Avex's training history.
+default-members = ["crates/relay-bus", "crates/relay-core", "crates/relay-cli", "crates/relay-remote", "crates/relay-board", "crates/relay-client", "crates/relay-money", "crates/relay-arbiter", "crates/relay-gym"]
 
 [workspace.package]
 version = "4.0.0-dev"
@@ -25,6 +25,7 @@ relay-board = { path = "crates/relay-board" }
 relay-client = { path = "crates/relay-client" }
 relay-money = { path = "crates/relay-money", default-features = false }
 relay-arbiter = { path = "crates/relay-arbiter", default-features = false }
+relay-gym = { path = "crates/relay-gym", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 schemars = { version = "1", features = ["uuid1", "preserve_order"] }

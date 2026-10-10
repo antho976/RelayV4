@@ -16,5 +16,7 @@ thiserror.workspace = true
 relay-money.workspace = true
 # The arbiter.* contract's shapes; without SQLite or the exchange client.
 relay-arbiter.workspace = true
+# The gym.* contract's shapes; without SQLite.
+relay-gym.workspace = true
 
 [dev-dependencies]
