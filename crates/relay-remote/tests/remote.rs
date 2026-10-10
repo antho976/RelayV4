@@ -40,6 +40,7 @@ async fn harness() -> Harness {
         registry_path: dir.path().join("remote.json"),
         socket_path: socket.path.clone(),
         version: "test".into(),
+        start_engine: None,
     });
     Harness { _dir: dir, engine, _socket: socket, ctx }
 }
@@ -789,6 +790,7 @@ async fn a_phone_is_let_go_when_the_engine_goes() {
         registry_path: dir.path().join("remote.json"),
         socket_path,
         version: "test".into(),
+        start_engine: None,
     });
     let door = DirectServer::bind(ctx.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .await
@@ -805,6 +807,70 @@ async fn a_phone_is_let_go_when_the_engine_goes() {
     let mut ws = admit(&url, &device, &token).await;
     assert!(closes_within(&mut ws, Duration::from_secs(5)).await, "the phone stayed connected to no engine");
     engine.abort();
+}
+
+/// The login service's door (`relay remote serve --start-engine`, deploy/relay-door.service):
+/// with no engine running, a paired phone is told so in the greeting and, once admitted, the door
+/// starts one and carries the phone's requests to it. A stand-in engine plays the part here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_door_that_may_start_the_engine_starts_it_for_a_phone() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("engine.sock");
+    let pid_path = dir.path().join("engine.pid");
+    let relay = dir.path().join("relay");
+    std::fs::write(
+        &relay,
+        format!(
+            r#"#!/usr/bin/env python3
+import json, os, socket, threading
+open({pid:?}, "w").write(str(os.getpid()))
+s = socket.socket(socket.AF_UNIX)
+s.bind({sock:?})
+s.listen(8)
+def serve(c):
+    f = c.makefile("rwb")
+    for line in f:
+        req = json.loads(line)
+        f.write((json.dumps({{"v": 1, "id": req["id"], "ok": True, "result": {{"op": req["op"]}}}}) + "\n").encode())
+        f.flush()
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()
+"#,
+            pid = pid_path.display().to_string(),
+            sock = socket_path.display().to_string(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&relay, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ctx = Arc::new(Ctx {
+        instance: Instance::Test,
+        registry_path: dir.path().join("remote.json"),
+        socket_path: socket_path.clone(),
+        version: "test".into(),
+        start_engine: Some(relay),
+    });
+    let door = DirectServer::bind(ctx.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let url = format!("ws://{}", door.local_addr);
+    let (device, token, greeting) = pair(&url, &pair_code(&ctx)).await;
+    assert_eq!(greeting.engine.as_deref(), Some("stopped"));
+    assert!(!socket_path.exists(), "pairing alone must not start the engine");
+
+    let mut ws = admit(&url, &device, &token).await;
+    let resp = call(&mut ws, "bus.ping", json!({})).await;
+    assert_eq!(resp["ok"], json!(true), "{resp}");
+    assert_eq!(resp["result"]["op"], json!("bus.ping"));
+    // A second phone finds it running.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let again: Greeting = serde_json::from_str(&recv_text(&mut ws2).await).unwrap();
+    assert_eq!(again.engine.as_deref(), Some("running"));
+    assert!(dir.path().join("engine.log").exists());
+
+    let pid = std::fs::read_to_string(&pid_path).unwrap();
+    let _ = std::process::Command::new("kill").arg(pid.trim()).status();
 }
 
 /// Tally's sync, as the phone runs it (apps/tally `PcSync`): pair, prove, send the whole ledger
@@ -852,8 +918,12 @@ async fn tally_syncs_its_ledger_through_the_door() {
     assert_eq!(changes.len(), 1, "{next}");
     assert_eq!((changes[0]["row"]["account"].as_str(), changes[0]["row"]["amount"].as_i64()), (Some("a1"), Some(210_000)));
 
-    // A phone syncs; it does not read or wipe the ledger through any other door.
-    for op in ["money.summary", "money.reset", "money.import", "money.invest.summary", "money.invest.import"] {
+    // Relay's phone app reads the ledger for its Threads space; what it shows is what the PC has.
+    let read = call(&mut ws, "money.summary", json!({"today": "2026-10-07"})).await;
+    assert_eq!(read["result"]["spent"].as_i64(), Some(4_250), "{read}");
+    // Beyond syncing, a phone only undoes an entry a thread added (`money.tx.delete` / `restore`);
+    // it adds nothing directly, and wipes or replaces nothing.
+    for op in ["money.reset", "money.import", "money.tx.add", "money.invest.import", "money.settings.set"] {
         let refused = call(&mut ws, op, json!({})).await;
         assert_eq!(refused["error"]["code"], "remote.op", "{op}: {refused}");
     }

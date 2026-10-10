@@ -24,6 +24,7 @@ pub mod pairlink;
 pub mod registry;
 pub mod rendezvous;
 pub mod tunnel;
+pub mod wake;
 pub mod wire;
 
 pub use bridge::Ctx;

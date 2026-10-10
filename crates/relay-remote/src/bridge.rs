@@ -22,6 +22,10 @@ pub struct Ctx {
     pub registry_path: PathBuf,
     pub socket_path: PathBuf,
     pub version: String,
+    /// The `relay` binary this door starts the engine with when an admitted phone finds none
+    /// answering (`relay remote serve --start-engine`). `None` for a door that lives inside its
+    /// engine (`relay serve --remote`), or one that only fronts an engine someone else runs.
+    pub start_engine: Option<PathBuf>,
 }
 
 impl Ctx {
@@ -31,6 +35,7 @@ impl Ctx {
             registry_path: Registry::path_for(instance),
             socket_path: instance.socket_path(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            start_engine: None,
         }
     }
 }
@@ -40,7 +45,7 @@ impl Ctx {
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a phone presenting a code that needs the PC's approval waits for it. The phone
-/// waits 90 s for the welcome to a pairing (RelayClient.ts `PAIR_WELCOME_TIMEOUT_MS`), so this
+/// waits 90 s for the welcome to a pairing (`Handshake.PAIR_WELCOME_TIMEOUT_MS` in apps/relay-android), so this
 /// stays under that and the phone hears `pair.unconfirmed` rather than its own timeout; a person
 /// who is slower runs `relay remote pair` again. Both doors ping during the wait, so neither
 /// drops the quiet phone first. A phone that leaves sooner (an older app gives up after 20 s)
@@ -226,7 +231,7 @@ fn still_admitted(ctx: &Ctx, device_id: &str, token: &str) -> bool {
     Registry::load(&ctx.registry_path).is_ok_and(|r| r.device(device_id).is_some_and(|d| d.token == token))
 }
 
-pub fn greeting(ctx: &Ctx, registry: &Registry, challenge: &str) -> Greeting {
+pub fn greeting(ctx: &Ctx, registry: &Registry, challenge: &str, engine_up: bool) -> Greeting {
     Greeting {
         v: WIRE_V,
         relay: "remote".into(),
@@ -235,7 +240,72 @@ pub fn greeting(ctx: &Ctx, registry: &Registry, challenge: &str) -> Greeting {
         instance: ctx.instance.as_str().into(),
         version: ctx.version.clone(),
         challenge: challenge.into(),
+        // Only a door that can start the engine says it is stopped: the phone then waits for it.
+        engine: Some(if engine_up || ctx.start_engine.is_none() { "running" } else { "stopped" }.into()),
+        wake: crate::wake::targets(),
     }
+}
+
+/// How long a door that started the engine waits for its socket to answer.
+const ENGINE_START_WAIT: Duration = Duration::from_secs(30);
+
+/// Connect to the engine's socket door, starting the engine first when this door may and none
+/// answers. Several phones arriving at once start it once: a second `relay serve` finds the
+/// instance lock held and exits, and every waiter connects to whichever one won.
+async fn engine(ctx: &Ctx) -> Result<UnixStream> {
+    if let Ok(stream) = UnixStream::connect(&ctx.socket_path).await {
+        return Ok(stream);
+    }
+    let Some(relay) = &ctx.start_engine else {
+        anyhow::bail!("no engine at {}", ctx.socket_path.display());
+    };
+    static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = STARTING.lock().await;
+    if !relay_core::socket::probe(&ctx.socket_path).await {
+        start_engine(relay, ctx)?;
+        let deadline = tokio::time::Instant::now() + ENGINE_START_WAIT;
+        while !relay_core::socket::probe(&ctx.socket_path).await {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("the engine did not answer within {}s of starting; see {}", ENGINE_START_WAIT.as_secs(), engine_log(ctx).display());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    UnixStream::connect(&ctx.socket_path)
+        .await
+        .with_context(|| format!("no engine at {}", ctx.socket_path.display()))
+}
+
+/// Beside `remote.json`, in the instance's data directory.
+fn engine_log(ctx: &Ctx) -> PathBuf {
+    ctx.registry_path.with_file_name("engine.log")
+}
+
+/// `relay --instance <i> serve` in its own process group, its output in the instance's
+/// `engine.log`. It outlives this door, as an engine started by `./run.sh` outlives its
+/// terminal: closing the door must not end the agents the engine holds.
+fn start_engine(relay: &std::path::Path, ctx: &Ctx) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    let instance = ctx.instance;
+    let log_path = engine_log(ctx);
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).with_context(|| format!("opening {}", log_path.display()))?;
+    let mut child = std::process::Command::new(relay)
+        .args(["--instance", instance.as_str(), "serve"])
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("starting {} serve", relay.display()))?;
+    tracing::warn!(pid = child.id(), instance = %instance, "a paired phone found no engine; started one");
+    // Reaped when it exits, so an engine that stops before this door leaves no zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 /// Run one conversation to its end. `inbound` carries text frames from the phone; `outbound`
@@ -251,7 +321,8 @@ pub async fn run(
 ) -> std::result::Result<(), BridgeEnd> {
     let registry = Registry::load(&ctx.registry_path).map_err(BridgeEnd::Other)?;
     let challenge = crate::registry::random_hex(16);
-    let greet = greeting(&ctx, &registry, &challenge);
+    let engine_up = ctx.start_engine.is_none() || relay_core::socket::probe(&ctx.socket_path).await;
+    let greet = greeting(&ctx, &registry, &challenge, engine_up);
     outbound
         .send(serde_json::to_string(&greet).context("greeting")?)
         .await
@@ -293,10 +364,8 @@ pub async fn run(
     tracing::info!(device = %admitted.device_id, instance = %ctx.instance, "remote device admitted");
     drop(unproven);
 
-    // Only now does the engine hear about this connection.
-    let stream = UnixStream::connect(&ctx.socket_path)
-        .await
-        .with_context(|| format!("no engine at {}", ctx.socket_path.display()))?;
+    // Only now does the engine hear about this connection; a door that may start it does so here.
+    let stream = engine(&ctx).await?;
     relay_core::socket::same_user(&stream)?;
     let (reader, mut writer) = stream.into_split();
 
@@ -383,6 +452,7 @@ mod tests {
             registry_path: dir.path().join("remote.json"),
             socket_path: dir.path().join("none.sock"),
             version: "test".into(),
+            start_engine: None,
         }
     }
 

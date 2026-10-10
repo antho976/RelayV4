@@ -1,0 +1,105 @@
+package com.quietsoftware.relay.ui
+
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.runtime.Composable
+import androidx.navigation.NavBackStackEntry
+import androidx.navigation.NavType
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.navArgument
+import com.quietsoftware.relay.ui.code.FileScreen
+import com.quietsoftware.relay.ui.code.FilesScreen
+import com.quietsoftware.relay.ui.code.GitScreen
+import com.quietsoftware.relay.ui.dev.AgentsScreen
+import com.quietsoftware.relay.ui.dev.LaunchScreen
+import com.quietsoftware.relay.ui.dev.SessionScreen
+import com.quietsoftware.relay.ui.dev.TerminalScreen
+import com.quietsoftware.relay.ui.pair.PairScreen
+import com.quietsoftware.relay.ui.pair.PcScreen
+import com.quietsoftware.relay.ui.pages.GuardrailsScreen
+import com.quietsoftware.relay.ui.pages.InboxScreen
+import com.quietsoftware.relay.ui.pages.MailboxScreen
+import com.quietsoftware.relay.ui.pages.NoteScreen
+import com.quietsoftware.relay.ui.pages.NotesScreen
+import com.quietsoftware.relay.ui.pages.OutboxScreen
+import com.quietsoftware.relay.ui.pages.PluginsScreen
+import com.quietsoftware.relay.ui.pages.SearchScreen
+import com.quietsoftware.relay.ui.pages.SettingsScreen
+import com.quietsoftware.relay.ui.pages.ShareScreen
+import com.quietsoftware.relay.ui.pages.SkillsScreen
+import com.quietsoftware.relay.ui.start.StartScreen
+import com.quietsoftware.relay.ui.tasks.BoardScreen
+import com.quietsoftware.relay.ui.tasks.ModulesScreen
+import com.quietsoftware.relay.ui.tasks.TaskEditScreen
+import com.quietsoftware.relay.ui.tasks.TaskScreen
+import com.quietsoftware.relay.ui.threads.ArbiterScreen
+import com.quietsoftware.relay.ui.threads.AvexScreen
+import com.quietsoftware.relay.ui.threads.TallyScreen
+import com.quietsoftware.relay.ui.threads.ThreadScreen
+import com.quietsoftware.relay.ui.threads.ThreadsHome
+import com.quietsoftware.relay.ui.tools.AddProjectScreen
+import com.quietsoftware.relay.ui.tools.DevicesScreen
+import com.quietsoftware.relay.ui.tools.IntegrationScreen
+import com.quietsoftware.relay.ui.tools.PcToolsScreen
+import com.quietsoftware.relay.ui.tools.ProjectSettingsScreen
+
+private fun NavBackStackEntry.str(key: String): String? = arguments?.getString(key)?.takeIf { it.isNotEmpty() }
+private fun NavBackStackEntry.long(key: String): Long? = str(key)?.toLongOrNull()
+
+private fun opt(name: String) = navArgument(name) { type = NavType.StringType; nullable = true; defaultValue = null }
+
+/** Every destination and the screen that draws it. Arguments are strings; screens get them typed. */
+@Composable
+fun AppNav(nav: Nav, startRoute: String) {
+    NavHost(
+        navController = nav.controller,
+        startDestination = startRoute,
+        enterTransition = { fadeIn() },
+        exitTransition = { fadeOut() },
+    ) {
+        composable("start") { StartScreen(nav) }
+        composable("agents") { AgentsScreen(nav) }
+        composable("terminal/{name}") { TerminalScreen(it.str("name").orEmpty(), nav) }
+        composable("session/{name}") { SessionScreen(it.str("name").orEmpty(), nav) }
+        composable("launch?project={project}&task={task}&prompt={prompt}", listOf(opt("project"), opt("task"), opt("prompt"))) {
+            LaunchScreen(it.long("project"), it.long("task"), it.str("prompt"), nav)
+        }
+        composable("board?project={project}", listOf(opt("project"))) { BoardScreen(it.long("project"), nav) }
+        composable("task/{id}") { TaskScreen(it.str("id").orEmpty(), nav) }
+        composable("task-edit?id={id}&project={project}&parent={parent}&column={column}", listOf(opt("id"), opt("project"), opt("parent"), opt("column"))) {
+            TaskEditScreen(it.str("id"), it.long("project"), it.long("parent"), it.str("column"), nav)
+        }
+        composable("modules/{project}") { ModulesScreen(it.long("project") ?: 0, nav) }
+        composable("notes?project={project}", listOf(opt("project"))) { NotesScreen(it.long("project"), nav) }
+        composable("note?id={id}&project={project}", listOf(opt("id"), opt("project"))) { NoteScreen(it.str("id"), it.long("project"), nav) }
+        composable("inbox") { InboxScreen(nav) }
+        composable("outbox") { OutboxScreen(nav) }
+        composable("search") { SearchScreen(nav) }
+        composable("share?text={text}", listOf(opt("text"))) { ShareScreen(it.str("text").orEmpty(), nav) }
+        composable("skills") { SkillsScreen(nav) }
+        composable("plugins") { PluginsScreen(nav) }
+        composable("guardrails?project={project}", listOf(opt("project"))) { GuardrailsScreen(it.long("project"), nav) }
+        composable("mailbox/{project}?session={session}", listOf(opt("session"))) { MailboxScreen(it.long("project") ?: 0, it.str("session"), nav) }
+        composable("files/{project}?worktree={worktree}", listOf(opt("worktree"))) { FilesScreen(it.long("project") ?: 0, it.str("worktree"), nav) }
+        composable("file/{project}?path={path}&worktree={worktree}", listOf(opt("path"), opt("worktree"))) {
+            FileScreen(it.long("project") ?: 0, it.str("path").orEmpty(), it.str("worktree"), nav)
+        }
+        composable("git/{project}?worktree={worktree}&session={session}", listOf(opt("worktree"), opt("session"))) {
+            GitScreen(it.long("project") ?: 0, it.str("worktree"), it.str("session"), nav)
+        }
+        composable("threads") { ThreadsHome(nav) }
+        composable("thread/{id}") { ThreadScreen(it.str("id").orEmpty(), nav) }
+        composable("tally") { TallyScreen(nav) }
+        composable("arbiter") { ArbiterScreen(nav) }
+        composable("avex") { AvexScreen(nav) }
+        composable("pair?link={link}", listOf(opt("link"))) { PairScreen(it.str("link"), nav) }
+        composable("pc") { PcScreen(nav) }
+        composable("settings") { SettingsScreen(nav) }
+        composable("project-settings/{project}") { ProjectSettingsScreen(it.long("project") ?: 0, nav) }
+        composable("devices/{project}") { DevicesScreen(it.long("project") ?: 0, nav) }
+        composable("integration/{project}") { IntegrationScreen(it.long("project") ?: 0, nav) }
+        composable("add-project") { AddProjectScreen(nav) }
+        composable("pc-tools") { PcToolsScreen(nav) }
+    }
+}

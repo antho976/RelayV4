@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- The WebSocket to the paired PC: LAN, Tailscale, or the person's own rendezvous. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- The pairing QR. Optional: a link or a typed code pairs as well. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <!-- An agent that needs you, while the app is in the background. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- "Stay connected": the link kept open in the background, shown as an ongoing notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Wake-on-LAN's broadcast reaches only the network the phone is on. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <application
+        android:name=".RelayApp"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Relay"
+        tools:targetApi="36">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Relay.Starting"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Text from another app: made into a task, a note, a thread or mail (ShareScreen). -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <!-- `relay://pair?…` from a browser, a chat or another app's QR reader. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="relay" android:host="pair" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".service.LinkService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the link to the owner's own PC open so agents that need them can say so." />
+        </service>
+
+        <receiver
+            android:name=".service.ActionReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Hilt supplies WorkManager's factory (RelayApp). -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+    </application>
+</manifest>

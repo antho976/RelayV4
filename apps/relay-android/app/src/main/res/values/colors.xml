@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ground">#FF171614</color>
+    <color name="ink">#FFEDE9E2</color>
+    <color name="dimmed">#FF63666B</color>
+    <color name="signal">#FFC6F24E</color>
+</resources>
