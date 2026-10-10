@@ -1,0 +1,29 @@
+# systemd --user unit for the PC: the phone door alone, from login, starting the engine when a
+# paired phone arrives and none is running (docs/ANDROID.md, "With the PC on and Relay closed").
+#
+# The door is small and idle until a phone connects. The engine it starts is the same one
+# ./run.sh starts: ./run.sh reuses it (when it is the binary run.sh just built), and the desktop
+# app is its client as before. An engine started by ./run.sh keeps its own door closed while this
+# one holds port 7420 ("phone door not opened"), and this door fronts it.
+#
+# It runs the `dev` instance, the desktop app's. Edit the path to your checkout, then
+#   mkdir -p ~/.config/systemd/user && cp deploy/relay-door.service ~/.config/systemd/user/
+#   systemctl --user enable --now relay-door
+# Pair a phone with `relay --instance dev remote pair`, as before.
+[Unit]
+Description=Relay phone door (dev instance), starting the engine on demand
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=%h/RelayV4/target/debug/relay --instance dev remote serve --start-engine
+Restart=on-failure
+RestartSec=2
+Environment=RELAY_LOG=info
+# Stopping or restarting the door must not end the engine it started, nor the agents that engine
+# holds: only the door's own process is signalled.
+KillMode=process
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

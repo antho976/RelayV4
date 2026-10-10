@@ -1,8 +1,8 @@
 # Relay from a phone
 
-The Relay mobile app (`apps/relay-mobile`, "Relay" on the phone) reaches the engine on this
-machine through `crates/relay-remote`: the same bus lines the desktop client and the CLI speak
-(`BUS.md` §6.2), carried over a WebSocket to a phone that paired once.
+Relay's phone app (`apps/relay-android`, "Relay" on the phone; [ANDROID.md](ANDROID.md)) reaches
+the engine on this machine through `crates/relay-remote`: the same bus lines the desktop client
+and the CLI speak (`BUS.md` §6.2), carried over a WebSocket to a phone that paired once.
 
 Two routes, tried in privacy order by the phone:
 
@@ -34,9 +34,9 @@ up after 75, and the phone then says nobody approved it (`pair.unconfirmed`). A 
 phone the PC declined (`pair.declined`). Either way the code is spent: run `relay remote pair`
 again. A phone that gives up sooner withdraws its request, so a late yes pairs nothing.
 
-On the phone: install the app (the `relay-mobile-apk` artifact of the **Mobile APK** workflow,
-run from the Actions tab, or `npm run android` in `apps/relay-mobile` with the Android SDK),
-open it, tap **Pair a PC**, scan. If the engine was running from before the
+On the phone: install the app (the `relay-android-apk` artifact of the **Relay Android**
+workflow, or `./gradlew :app:installDebug` in `apps/relay-android` with the phone plugged in),
+open it, scan. If the engine was running from before the
 door existed, restart it once (`./target/debug/relay --instance dev cmd app.quit '{}'`, then
 `./run.sh`), or run `./target/debug/relay remote serve --pair` alongside it. The quit is refused
 while agents are live (`app.sessions_live`); `app.quit '{"force":true}'` stops them, and their
@@ -79,6 +79,7 @@ a paired phone out. A browser page on another site cannot open it (the `Origin` 
 | command | does |
 | --- | --- |
 | `relay remote serve --bind 192.168.1.20:7420` | listen on one address only |
+| `relay remote serve --start-engine` | serve phones with no engine running, and start one when a paired phone arrives (the login unit `deploy/relay-door.service`; ANDROID.md) |
 | `relay remote devices` | list paired phones |
 | `relay remote revoke <id>` | forget a phone; a connection it has open closes within seconds and its next one is refused (once no phone is left, the door goes quiet, so that phone sees the PC as unreachable rather than "no longer paired") |
 | `relay remote name "antho desktop"` | the name phones show |
@@ -95,10 +96,10 @@ account. The PC then has a `100.x.y.z` address that the phone can reach from any
 the direct door already listens on it: `relay remote pair` prints it on a `Tailscale:` line and
 puts it in the pairing link, so a phone paired after Tailscale was set up just works.
 
-For a phone paired before that, open **Paired PCs**, tap **Add Tailscale or other address** on
-the PC's card, and enter the PC's Tailscale address (`100.x.y.z`, or its MagicDNS name
-`my-pc.tail1234.ts.net`). Added addresses are tried with the WiFi ones, survive re-pairing, and
-the home screen's card says **Tailscale · private** when that is the link in use. Traffic travels
+For a phone paired before that, open the PC's page (tap the PC's line in the status bar), and
+under **Routes** enter the PC's Tailscale address (`100.x.y.z`, or its MagicDNS name
+`my-pc.tail1234.ts.net`). Added addresses are tried with the WiFi ones, and the status bar says
+**Tailscale** when that is the link in use. Traffic travels
 over Tailscale's encrypted WireGuard tunnel; nothing on the PC listens to the internet.
 
 ## 4. From anywhere: your own rendezvous
@@ -161,82 +162,39 @@ most 32 phones at once.
 
 ## 5. On the phone
 
-The app is Relay first: it opens on the PC. The home screen is one line that says which PC is
-connected and how (WiFi, Tailscale or your server), a row when something needs you (holds,
-blocked agents, tasks to review), a slim card of figures and provider usage, the live agents
-grouped by project, the stopped agents folded into one row, and a **New terminal** button.
-The header has three buttons:
-
-- **The menu** (left, or swipe from the left edge) opens the app's drawer: the PC at the
-  top with its workspaces, inbox and paired PCs, then **Local** — the characters, models
-  and recent chats that run on the phone itself.
-- **The bell** opens the **Inbox**, with a badge for how much is waiting: guardrail holds,
-  tasks in review, and the notification feed. Tap a notification to mark it read on the PC.
-- **The folder** (right, or swipe from the right edge) opens the workspaces sidebar: every
-  workspace on the PC and the projects in it, each with how many agents are live there. Tap
-  one to narrow the home screen — and the New terminal sheet — to it; the board icon next
-  to a project opens its board.
-
-Tapping the PC's line opens **Paired PCs**: every PC this phone knows, its routes, adding an
-address, pairing another, and the two things the link may do to the phone (notify you, keep
-the screen on in a terminal).
+The app looks like the desktop: the Dev | Threads switch, the sidebar as a drawer, the status bar
+with the link, the route in use and what waits in the outbox. It keeps a copy of the PC's data and
+works with the PC away; [ANDROID.md](ANDROID.md) says how, and what it does when the PC is on,
+asleep or off.
 
 **Pairing.** Scan the QR that `relay remote pair` prints. Without a camera, paste the
 `relay://pair?…` link, or type the address the PC printed and the eight-character code, then
 approve the phone in the terminal on the PC when it asks. The code is spent on use, whether
-the PC said yes or no.
+the PC said yes or no. A `relay://pair` link opened from another app only fills the field; pairing
+takes a tap.
 
-**Routes.** Each PC card shows where it can be reached and lets you pin a route: **Auto** tries
+**Routes.** The PC's page shows where it can be reached and lets you pin a route: **Auto** tries
 the direct addresses (WiFi and Tailscale) first and the server second; **Direct only** never
-uses the server; **Server only** always goes through the rendezvous. The route in use is marked.
+uses the server; **Server only** always goes through the rendezvous.
 
 **What you can do.** Everything is an existing bus op, limited to the ones the door lets a
 phone call (see the top of this page):
 
-- **New terminal**: pick a project and an agent (claude or codex), optionally a first message,
-  and a session starts in its own worktree (`session.create` + `session.spawn`); its terminal
-  opens. **More options** opens the full launcher (several agents, a review group, staged
-  tasks). To track work on the board, create the task there and dispatch it.
-- **Sessions**: every live agent session grouped by project, with Relay's lamps (green
-  running, red held, amber spawning). Tap one for its terminal. Agents stopped by a PC restart
-  sit in one folded "stopped agents" row at the end, with Resume per agent or Resume all.
-- **Terminal**: a real terminal emulator (xterm.js, headless) rebuilt from the engine's raw
-  replay (`session.attach` with no position replays up to 256 KiB, then streams live), so
-  Claude Code and Codex redraws look as they do on the PC. While it is open it borrows the
-  PTY at the phone's own width (see below); pinch or the ⋯ menu's text size reflows it.
-  Type in the composer and send;
-  the text and its Enter go as separate writes so a TUI does not take them for a paste
-  (several lines go as one bracketed paste when the program asks for it). The key row has
-  Esc, Tab, arrows, Enter, Ctrl-C, `y`/`n`; the ⋯ menu carries **Summarize**, **Changes**,
-  **Mail**, copy, text size, **Use the PC's width** / **Fit to this phone**, and **Park** /
-  **Wake** / **Resume** as the session's state allows. Keystrokes go through `session.input`, which the engine answers without touching
-  its store.
-- **Mail**: priority mail to that agent (`mailbox.send`). It reaches an agent that is busy at
-  its next step, where a typed line would wait in the terminal until it reads its prompt.
-- **Inbox**: guardrail holds with **Allow once** / **Deny** (`guardrail.confirm` /
-  `guardrail.reject`), unread notifications, and how many tasks wait for review. With the app
-  in the background, a held, blocked or finished agent shows up as a notification; it comes
-  from the PC link, not from a push service.
-- **Board**: the project's tasks by column (`task.list`). Approve what is in review
-  (`task.approve`), dispatch what is waiting (`task.dispatch`), jump to a task's terminal or
-  changes.
-- **Changes**: the files an agent changed in its worktree (`git.status`, `git.diff`), with a
-  tap for the hunks (`git.diff.file`).
-- **Summary**: with a local model loaded, the phone's own model reads the terminal text and
-  says what the agent did and what it needs. The text never leaves the phone.
+- **Agents**: the project's agents as terminal plates with a live miniature; a tap opens the
+  terminal, which borrows the PTY at the phone's own size (`session.resize {until_detach}`), with
+  a key row and a composer. **New agent** starts one (`session.create` + `session.spawn`), queued
+  until the PC is back if it is away.
+- **Inbox**: guardrail holds with the exact held action and **Allow once** / **Deny**
+  (`guardrail.confirm` / `guardrail.reject`), tasks in review, and the notification feed.
+- **Board, tasks, modules, notes and mail**: read from the phone's copy, edited through the
+  outbox.
+- **Files and Git**: the tree, files, changes, commits, pushes and pull requests, with the PC.
+- **Threads**: the PC's conversations, streamed as they are written, and Tally, Arbiter and Avex.
 
-While a terminal is open, the phone borrows the session's PTY at the phone's own width and
-height (`session.resize {until_detach}`), so the agent lays itself out for the phone instead
-of being shrunk or cut off at the PC's width; the desktop shows the narrow layout meanwhile.
-Changing the text size reflows it to as many columns as fit. The PC's size comes back by
-itself when you leave the terminal, put the phone away, or the link drops. **Use the PC's
-width** in the ⋯ menu keeps the PC's size instead, fitted to the screen with pinch to zoom.
-A PC whose Relay predates this keeps its width.
-
-The link reconnects by itself after a drop, and again the moment the app comes back to the
-foreground; **Disconnect** on a PC card stops that until you connect again.
-
-The phone's own chats and on-device models never touch this link.
+With the app in the background, a held, blocked or finished agent shows up as a notification; it
+comes from the PC link (**Stay connected**), not from a push service. The link reconnects by
+itself after a drop and when the app comes back to the foreground; **Disconnect** on the PC's page
+stops that until you connect again.
 
 ## 6. Security model, honestly
 
@@ -254,7 +212,7 @@ The phone's own chats and on-device models never touch this link.
   PC approves each phone that presents one before it gets a token (unless `--no-confirm`), so
   a code seen by someone else — a screen share, scrollback — pairs nothing on its own. Every
   pairing is logged and toasted on the desktop. A device token is 256 bits, stored on
-  the PC in `remote.json` and on the phone in its private storage.
+  the PC in `remote.json` and on the phone sealed with a key in its keystore.
 - After pairing, the token is never sent again: each connection gets a random challenge and
   the phone answers with `sha256(challenge:token)`. Listening on the LAN yields proofs that
   are only good for that connection.
@@ -293,5 +251,5 @@ cargo test -p relay-remote
 covers pairing, proof, revocation, the actor gate, the op gate (`settings.set` refused),
 `GET /info`, event interleaving and a
 two-phone rendezvous session against a real engine. It runs in CI with the rest of the
-headless crates. The app itself is typechecked and linted in CI
-(`npx tsc --noEmit -p tsconfig.json && npm run lint` in `apps/relay-mobile`).
+headless crates. The app's own tests, Lint and APK builds run in `relay-android.yml`, and
+`LiveDoorTest` runs its link and sync code against a real door (ANDROID.md).

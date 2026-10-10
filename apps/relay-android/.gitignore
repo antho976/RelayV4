@@ -1,0 +1,22 @@
+*.iml
+.gradle/
+.kotlin/
+build/
+/local.properties
+/captures
+.externalNativeBuild
+.cxx
+.idea/
+*.apk
+*.aab
+*.jks
+*.keystore
+keystore.properties
+.DS_Store
+.impeccable/review/
+.impeccable/build/
+.impeccable/config.local.json
+
+# ScreensTest renders every main screen for review (recordRoborazziDebug); the seeded data shows
+# relative times, so the renders are looked at, not kept as goldens.
+app/src/test/screenshots/

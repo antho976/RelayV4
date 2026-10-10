@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose draws everything; this only paints the window before it does, in the console's ground. -->
+    <style name="Theme.Relay" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/ground</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <style name="Theme.Relay.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/ground</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_mark</item>
+        <item name="postSplashScreenTheme">@style/Theme.Relay</item>
+    </style>
+</resources>

@@ -21,21 +21,27 @@ native client's GTK-free logic:
 helpers and the device mirror's decoder gate and input payloads).
 The full list in `README.md` is for a developer machine with GTK.
 
-## The mobile app: `apps/relay-mobile`
+## The phone app: `apps/relay-android`
 
-An Expo / React Native app with its own toolchain, independent of Cargo. Verify a change with
+Relay's Android app (Kotlin, Compose, Room, Gradle; `docs/ANDROID.md`), independent of Cargo.
+Verify a change with
 
 ```fish
-cd apps/relay-mobile && npm ci && npx tsc --noEmit -p tsconfig.json && npm run lint
+cd apps/relay-android && ./gradlew :core:test :app:testDebugUnitTest :app:lintRelease
 ```
 
-Both run in CI. The Android build (`mobile-apk.yml`) runs on demand from the Actions tab or
-on a `mobile-v*` tag; an agent session has no Android SDK, so a change there is typechecked
-and linted, not run, and the summary must say so. Its PC-facing code is `lib/engine/Relay/`;
-the door it talks to is `crates/relay-remote`, whose integration tests send a selection of
-the bus payloads the phone sends, not all of them. Before changing an op the phone calls
-(`docs/MOBILE.md` names them per screen), check whether a remote test covers it. The new
-screens use literal English strings; the rest of the app is localized (`i18n/`), so `i18next/no-literal-string` warns on them.
+All three run in CI (`relay-android.yml`, only for changes under `apps/relay-android`), with both
+APK builds. `:core` is plain JVM (the wire, the replica and outbox rules, the terminal emulator)
+and needs no Android SDK; without one, a change to `:app` is written, not built, and the summary
+must say so. Robolectric unpacks native libraries into `java.io.tmpdir`: on a machine whose `/tmp`
+is full, run the app tests with `JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=<somewhere with room>`.
+
+The door it talks to is `crates/relay-remote`. Every op the app sends must be in `PHONE_OPS`
+(`wire.rs`), or the door refuses it with `remote.op`; the app's own link and sync code runs
+against a real door in `LiveDoorTest` (ANDROID.md, "Building and installing"). The PC is the
+authority for its data: the app reads a replica and sends edits through an outbox
+(`core/sync`), so an op it may queue offline needs a rule in `Optimistic` for how the row looks
+until the PC answers.
 
 ## Tally: `apps/tally` and `crates/relay-money`
 

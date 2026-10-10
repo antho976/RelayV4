@@ -1,0 +1,130 @@
+name: Relay Android
+
+# The native phone app (apps/relay-android): Kotlin, Compose, Room. Cheapest first:
+#
+#   guard   ~30s  Wrapper checksum, no signing material or build output in the tree, network code
+#                 only in data/link (the one way out of the app is the link to the paired PC).
+#   core    ~2m   The wire to the PC, the replica's rules, the outbox and the terminal emulator,
+#                 on the plain JVM, including the phone and a fake PC converging end to end.
+#   verify  ~15m  The app on the JVM, Android Lint, and both APKs including an R8 release;
+#                 the debug APK is uploaded as the `relay-android-apk` artifact.
+#
+# The PC side of the link is crates/relay-remote, tested by ci.yml.
+
+on:
+  push:
+    paths:
+      - "apps/relay-android/**"
+      - "!apps/relay-android/**.md"
+      - ".github/workflows/relay-android.yml"
+  pull_request:
+    paths:
+      - "apps/relay-android/**"
+      - "!apps/relay-android/**.md"
+      - ".github/workflows/relay-android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: apps/relay-android
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate Gradle wrapper checksum
+        uses: gradle/actions/wrapper-validation@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6
+
+      - name: No signing material or build output in the tree
+        run: |
+          found=$(git ls-files -- . | grep -E '\.(jks|keystore|p12)$|(^|/)keystore\.properties$|(^|/)(build|\.gradle|\.kotlin)/|(^|/)local\.properties$' || true)
+          if [ -n "$found" ]; then
+            echo "::error::Committed by mistake:"; echo "$found"; exit 1
+          fi
+          echo "Clean."
+
+      - name: Network code only in the link to the PC
+        # The phone reaches one place: the PC it paired with (directly, over Tailscale, or through
+        # the owner's own rendezvous). Wake-on-LAN's single UDP packet lives in data/Relay.kt.
+        run: |
+          offenders=$(grep -RlE 'okhttp3|java\.net\.(URL|Socket|HttpURLConnection)\b|HttpsURLConnection|newWebSocket|DatagramSocket' app/src/main/java \
+            | grep -vE '^app/src/main/java/com/quietsoftware/relay/data/(link/|Relay\.kt$)' || true)
+          if [ -n "$offenders" ]; then
+            echo "$offenders"
+            echo "::error::Network code outside data/link."; exit 1
+          fi
+
+  core:
+    name: Core (wire, sync, terminal)
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6
+        with:
+          cache-read-only: ${{ github.ref_name != github.event.repository.default_branch }}
+      - name: Install the Android platform (configuration needs it)
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$sdkmanager" "platforms;android-37.0" > /dev/null
+      - name: Core unit tests
+        run: ./gradlew --continue :core:test
+
+  verify:
+    name: Verify (app)
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6
+        with:
+          cache-read-only: ${{ github.ref_name != github.event.repository.default_branch }}
+      - name: Install the Android platform
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$sdkmanager" "platforms;android-37.0" > /dev/null
+      - name: App unit tests
+        run: ./gradlew --continue :app:testDebugUnitTest
+      - name: Android Lint
+        run: ./gradlew --continue :app:lintRelease
+      - name: Build both APKs
+        run: ./gradlew :app:assembleDebug :app:assembleRelease -PrelayCiSmokeSigning
+      - name: Permission allowlist
+        # What the app may ask for, and why, is in its manifest; a new permission is a decision.
+        run: |
+          manifest=app/build/intermediates/merged_manifests/release/processReleaseManifest/AndroidManifest.xml
+          [ -f "$manifest" ] || manifest=$(find app/build/intermediates -path '*release*' -name AndroidManifest.xml | head -1)
+          found=$(grep -oE 'android:name="android\.permission\.[A-Z_]+"' "$manifest" | sed -E 's/.*permission\.([A-Z_]+)"/\1/' | sort -u)
+          allowed="ACCESS_NETWORK_STATE CAMERA CHANGE_WIFI_MULTICAST_STATE FOREGROUND_SERVICE FOREGROUND_SERVICE_SPECIAL_USE INTERNET POST_NOTIFICATIONS RECEIVE_BOOT_COMPLETED WAKE_LOCK"
+          for p in $found; do
+            case " $allowed " in *" $p "*) ;; *) echo "::error::Unexpected permission $p"; exit 1 ;; esac
+          done
+          echo "$found"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: relay-android-apk
+          path: apps/relay-android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

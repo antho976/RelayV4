@@ -40,9 +40,10 @@ instance; runs of another instance or from a linked worktree leave it alone.
 
 The engine `run.sh` starts also carries the phone door, so a phone can reach it
 on the LAN directly (`relay remote pair` prints the QR code), or from anywhere
-through a rendezvous server you host. The phone app lives in `apps/relay-mobile`
-(Expo / React Native; built by the **Mobile APK** workflow). See
-[docs/MOBILE.md](docs/MOBILE.md).
+through a rendezvous server you host ([docs/MOBILE.md](docs/MOBILE.md)). The phone app is
+`apps/relay-android` (Kotlin, Compose, Room; the **Relay Android** workflow builds it): it keeps
+a copy of the PC's data so it works with the PC away, and can start the engine through
+`relay remote serve --start-engine` when the desktop app is closed ([docs/ANDROID.md](docs/ANDROID.md)).
 
 `apps/tally` is Tally, the budget and spending tracker for Android (Kotlin, Compose, Room),
 brought in from its own repository and built by the `tally-*` workflows. Its money rules are

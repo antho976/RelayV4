@@ -34,6 +34,11 @@ pub enum RemoteCommand {
         /// Do not dial the configured rendezvous this time
         #[arg(long)]
         no_rendezvous: bool,
+        /// Start the engine when a paired phone arrives and none is running, and serve phones
+        /// while it is down: the login service for a PC whose desktop app is closed
+        /// (deploy/relay-door.service)
+        #[arg(long)]
+        start_engine: bool,
     },
     /// Open a ten-minute pairing window, print the code and QR for the phone, and ask before it pairs
     Pair {
@@ -170,6 +175,8 @@ pub async fn serve_with_door(
         registry_path: Registry::path_for(instance),
         socket_path: served.socket.path.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        // The door lives inside this engine and ends with it.
+        start_engine: None,
     });
     // The door is a convenience on top of the engine, never a reason for the engine not to
     // start: a port already taken by another instance's door is logged and skipped, and so is a
@@ -254,15 +261,23 @@ async fn resolve_instance(requested: Instance) -> Instance {
 
 pub async fn run(requested: Instance, cmd: RemoteCommand) -> Result<u8> {
     let instance = match cmd {
-        RemoteCommand::Rendezvous { .. } => requested,
+        // A door that starts its own engine fronts the instance it was asked for, never another
+        // that happens to be running.
+        RemoteCommand::Rendezvous { .. } | RemoteCommand::Serve { start_engine: true, .. } => requested,
         _ => resolve_instance(requested).await,
     };
     let ctx = Arc::new(Ctx::for_instance(instance));
     match cmd {
-        RemoteCommand::Serve { bind, pair, no_confirm, no_rendezvous } => {
+        RemoteCommand::Serve { bind, pair, no_confirm, no_rendezvous, start_engine } => {
             init_logging();
             let addr: SocketAddr = bind.parse().with_context(|| format!("bad --bind {bind:?}"))?;
-            if !relay_core::socket::probe(&ctx.socket_path).await {
+            let ctx = if start_engine {
+                let relay = std::env::current_exe().context("finding this relay binary to start the engine with")?;
+                Arc::new(Ctx { start_engine: Some(relay), ..(*ctx).clone() })
+            } else {
+                ctx
+            };
+            if !start_engine && !relay_core::socket::probe(&ctx.socket_path).await {
                 eprintln!(
                     "relay remote: no engine answering at {} — start one with `./run.sh`, `relay serve`, or `relay serve --remote` (which needs no second command)",
                     ctx.socket_path.display()

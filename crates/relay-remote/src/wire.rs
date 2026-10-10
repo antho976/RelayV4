@@ -23,6 +23,14 @@ pub struct Greeting {
     pub version: String,
     /// Random per connection; the phone answers with `proof(challenge, token)`.
     pub challenge: String,
+    /// `running`, or `stopped` when no engine answers and this door starts one for an admitted
+    /// phone (`relay remote serve --start-engine`), so the phone can say the PC is waking Relay
+    /// rather than leave the person looking at a silent link. Absent from older doors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// This PC's network cards, for Wake-on-LAN from a phone on the same network (`wake.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wake: Vec<crate::wake::WakeTarget>,
 }
 
 /// The phone's answer: either a pairing code (first time) or a proof (every time after).
@@ -89,7 +97,8 @@ pub enum Gate {
     Reject(Box<Response>),
 }
 
-/// What a paired phone may call: the ops the app sends (apps/relay-mobile), and nothing else.
+/// What a paired phone may call: the ops the apps send (apps/relay-android, and Tally's sync),
+/// and nothing else.
 /// The socket door gives `user` the whole bus, which is right for a person at this machine's
 /// keyboard; a credential that lives on a phone, and can be lost with it, should not be able to
 /// reconfigure what the engine executes (`settings.set`, which holds `providers.*.path` and
@@ -97,6 +106,10 @@ pub enum Gate {
 /// starts sending is added here. Sorted: `gate` binary-searches it.
 pub const PHONE_OPS: &[&str] = &[
     "app.backup.list", "app.backup.now", "app.resources.watch",
+    // Arbiter on the phone: its reads, a proposal's answer, and the halt and restart keys.
+    "arbiter.decision.list", "arbiter.halt", "arbiter.order.list", "arbiter.proposal.list",
+    "arbiter.proposal.resolve", "arbiter.restart", "arbiter.series", "arbiter.settings.get",
+    "arbiter.strategy.get", "arbiter.summary",
     "audit.list", "audit.undo",
     "avd.boot", "avd.list",
     "bus.ping", "bus.subscribe", "bus.unsubscribe",
@@ -111,12 +124,18 @@ pub const PHONE_OPS: &[&str] = &[
     "github.connect", "github.repo.list", "github.status",
     "guardrail.config.get", "guardrail.config.set", "guardrail.confirm", "guardrail.hold.get",
     "guardrail.holds.list", "guardrail.reject",
+    // Avex's training history, read only.
+    "gym.cardio", "gym.lift.get", "gym.lifts", "gym.series", "gym.session.get", "gym.sessions",
+    "gym.summary",
     "integration.discard", "integration.get", "integration.list", "integration.request",
     "mailbox.list", "mailbox.outbox", "mailbox.send",
     "module.changelog.draft", "module.complete", "module.create", "module.delete", "module.get",
     "module.list", "module.reopen", "module.restore", "module.update",
-    // Tally's sync (apps/tally): the one money op a phone calls.
-    "money.sync",
+    // Tally's sync (apps/tally), and for the Threads space on the phone (apps/relay-android)
+    // the ledger's reads and the Undo of an entry a thread added.
+    "money.invest.delete", "money.invest.list", "money.invest.restore", "money.invest.summary",
+    "money.lists", "money.series", "money.summary", "money.sync", "money.tx.delete",
+    "money.tx.list", "money.tx.restore",
     "notes.append", "notes.create", "notes.delete", "notes.get", "notes.list", "notes.pin",
     "notes.restore", "notes.standing", "notes.update",
     "notify.ack", "notify.ack_all", "notify.list", "notify.settings.get", "notify.settings.set",
@@ -134,6 +153,9 @@ pub const PHONE_OPS: &[&str] = &[
     "task.create", "task.delete", "task.detach", "task.dispatch", "task.get", "task.label.add",
     "task.label.list", "task.label.remove", "task.link_commit", "task.list", "task.move",
     "task.parent.set", "task.relate", "task.restore", "task.unrelate", "task.update",
+    // The Threads space on the phone: the same conversations as the PC's.
+    "thread.create", "thread.delete", "thread.get", "thread.list", "thread.rename", "thread.send",
+    "thread.set", "thread.stop",
     "ui.page.switch",
     "usage.get",
     "workspace.create", "workspace.discover", "workspace.list", "workspace.remove", "workspace.update",
