@@ -33,6 +33,9 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -47,6 +50,7 @@ import com.tally.app.ui.common.DayBars
 import com.tally.app.ui.common.EndsRow
 import com.tally.app.ui.common.FIGURE_GAP
 import com.tally.app.ui.common.GUTTER
+import com.tally.app.ui.common.HeroNumber
 import com.tally.app.ui.common.HeroPanel
 import com.tally.app.ui.common.LedgerRow
 import com.tally.app.ui.common.LocalMoney
@@ -63,10 +67,12 @@ import com.tally.app.ui.common.TextAction
 import com.tally.app.ui.common.TopBar
 import com.tally.app.ui.common.TransferBadge
 import com.tally.app.ui.common.bounceClick
+import com.tally.app.ui.invest.investContext
 import com.tally.app.ui.nav.AppNav
 import com.tally.app.ui.nav.FAB_CLEARANCE
 import com.tally.app.ui.nav.HubTab
 import com.tally.app.ui.plan.GoalRow
+import com.tally.core.AccountType
 import com.tally.core.Copy
 import com.tally.core.PaceStatus
 import com.tally.core.TxType
@@ -93,6 +99,7 @@ fun HomeTab(nav: AppNav, openTab: (HubTab) -> Unit, viewModel: HomeViewModel = h
             addBill = { nav.billEdit(0) },
             openAccount = { nav.transactions(accountId = it) },
             accounts = nav::accounts,
+            investments = nav::investments,
             openGoal = { nav.goal(it) },
             addGoal = { nav.goalEdit(0) },
         ),
@@ -113,6 +120,8 @@ data class HomeActions(
     val addBill: () -> Unit = {},
     val openAccount: (Long) -> Unit = {},
     val accounts: () -> Unit = {},
+    /** The Investments page: the investment accounts fold into one row that opens it. */
+    val investments: () -> Unit = {},
     val openGoal: (Long) -> Unit = {},
     val addGoal: () -> Unit = {},
 )
@@ -229,9 +238,10 @@ private fun HomePanes(state: HomeState, actions: HomeActions, modifier: Modifier
 }
 
 /**
- * What is left of the month's budget, drawn: the screen's one serif hero under the accent's
- * light, the budget meter with today's pace tick, and chips for the readings that say what to do.
- * Without a budget it measures against income, honestly labelled, and offers the budget.
+ * What is left of the month's budget, drawn: the screen's one serif hero, the verdict in days
+ * leading the line under it ("4 days ahead of your money"), the budget meter with today's pace
+ * tick, and chips for the readings that say what to do. Without a budget it measures against
+ * income, honestly labelled, and offers the budget.
  */
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
@@ -241,22 +251,30 @@ private fun LeftToSpendHero(state: HomeState, actions: HomeActions, modifier: Mo
     val over = r?.status == PaceStatus.OVER_BUDGET
     val tint = if (over) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
     HeroPanel(modifier) {
-        // The kit's header: the pace reading drops under the label before the label would wrap.
+        // The kit's header: the pace reading drops under the label before the label would wrap. It
+        // carries the verdict in money; the line under the figure says it in days, so "On pace"
+        // is said once, there.
         PanelHeader(
             if (over) "Over budget" else if (r != null) "Left to spend" else "Left from income",
-            meta = if (r != null && !over) Copy.paceLine(r, money) else null,
+            meta = if (r != null && !over && r.status != PaceStatus.ON_PACE) Copy.paceLine(r, money) else null,
             tint = tint,
         )
         Spacer(Modifier.height(14.dp))
         if (r != null) {
+            HeroNumber(money.formatWhole(if (over) -r.remaining else r.remaining))
+            // The verdict leads in the strong voice; the reading it came from follows, muted. Over
+            // budget the label already says so, and the line says by how much.
+            val verdict = if (over) "" else Copy.daysLine(r)
+            val strong = MaterialTheme.colorScheme.onBackground
             Text(
-                money.formatWhole(if (over) -r.remaining else r.remaining),
-                style = MaterialTheme.typography.displayLarge,
-                color = MaterialTheme.colorScheme.onBackground,
-            )
-            Text(
-                (if (over) "over your " else "left of your ") + money.formatWhole(r.budget) + " budget · " +
-                    money.formatWhole(r.spent) + " spent",
+                buildAnnotatedString {
+                    if (verdict.isNotEmpty()) {
+                        withStyle(SpanStyle(color = strong)) { append(verdict) }
+                        append(" · ")
+                    }
+                    append((if (over) "over your " else "left of your ") + money.formatWhole(r.budget) + " budget · ")
+                    append(money.formatWhole(r.spent) + " spent")
+                },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -273,15 +291,12 @@ private fun LeftToSpendHero(state: HomeState, actions: HomeActions, modifier: Mo
             // the same breath ("$49 a day for 28 days") instead of repeating them as a chip.
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!over) StatChip(Icons.Rounded.Speed, Copy.marginLine(r, money))
-                StatChip(Icons.AutoMirrored.Rounded.TrendingUp, "Pace " + money.formatWhole(r.expected))
+                // "Pace $1,310" read as a target; the even pace is where the tick stands today.
+                StatChip(Icons.AutoMirrored.Rounded.TrendingUp, "Even pace " + money.formatWhole(r.expected) + " by today")
             }
         } else {
             val fraction = if (state.income > 0) state.spent.toFloat() / state.income else 0f
-            Text(
-                money.formatWhole(state.income - state.spent),
-                style = MaterialTheme.typography.displayLarge,
-                color = MaterialTheme.colorScheme.onBackground,
-            )
+            HeroNumber(money.formatWhole(state.income - state.spent))
             Text(
                 money.formatWhole(state.spent) + " spent of " + money.formatWhole(state.income) + " in",
                 style = MaterialTheme.typography.bodyMedium,
@@ -515,10 +530,20 @@ private fun BillRow(b: UpcomingBill, onClick: () -> Unit) {
     }
 }
 
+/** How many account rows Home lists; the investment accounts fold into one of them. */
+private const val ACCOUNT_ROWS = 5
+
+/**
+ * Where the money sits: the net, then each account with its balance. The investment accounts
+ * fold into one Investments row that opens the portfolio, since an entry count says nothing of a
+ * TFSA; what does not fit is counted, never cut silently.
+ */
 @Composable
 private fun AccountsPanel(state: HomeState, actions: HomeActions, modifier: Modifier = Modifier) {
     val money = LocalMoney.current
     val active = state.accounts.filter { !it.archived }
+    val (invested, others) = active.partition { it.type == AccountType.INVESTMENT }
+    val shown = others.take(if (invested.isEmpty()) ACCOUNT_ROWS else ACCOUNT_ROWS - 1)
     Panel(modifier) {
         PanelHeader("Accounts", action = "manage", onAction = actions.accounts)
         if (active.isEmpty()) {
@@ -529,37 +554,57 @@ private fun AccountsPanel(state: HomeState, actions: HomeActions, modifier: Modi
             Text(money.format(state.net), style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onBackground)
             Text(netAcrossLabel(active.size), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(6.dp))
-            active.take(5).forEach { a ->
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .bounceClick(label = "${a.name} entries", focusOutset = ROW_FOCUS_OUTSET) { actions.openAccount(a.id) }
-                        .heightIn(min = 60.dp)
-                        .padding(vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(14.dp),
-                ) {
-                    AccountBadge(a.type)
-                    EndsRow(
-                        start = {
-                            Column {
-                                Text(a.name, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onBackground)
-                                Text(
-                                    Copy.plural(a.entryCount, "entry", "entries"),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        },
-                        end = {
-                            Text(money.format(a.balance), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onBackground)
-                        },
-                        modifier = Modifier.weight(1f),
-                        gap = 14.dp,
-                    )
+            shown.forEach { a ->
+                AccountLine(a.type, a.name, Copy.plural(a.entryCount, "entry", "entries"), money.format(a.balance), "${a.name} entries") {
+                    actions.openAccount(a.id)
                 }
             }
+            if (invested.isNotEmpty()) {
+                val valuedOn = invested.mapNotNull { it.valuedOn }.maxOrNull()
+                AccountLine(
+                    AccountType.INVESTMENT,
+                    "Investments",
+                    investContext(invested.size, valuedOn, state.today) { Dates.short(it, state.today) },
+                    money.format(invested.sumOf { it.balance }),
+                    "Open investments",
+                    actions.investments,
+                )
+            }
+            val more = others.size - shown.size
+            if (more > 0) {
+                Spacer(Modifier.height(4.dp))
+                Text("and $more more", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
+    }
+}
+
+/** One account row on Home: its badge, its name over a quiet line, its balance. The whole row is the tap. */
+@Composable
+private fun AccountLine(type: AccountType, title: String, subtitle: String, amount: String, label: String, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .bounceClick(label = label, focusOutset = ROW_FOCUS_OUTSET, onClick = onClick)
+            .heightIn(min = 60.dp)
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        AccountBadge(type)
+        EndsRow(
+            start = {
+                Column {
+                    Text(title, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onBackground)
+                    Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
+            end = {
+                Text(amount, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onBackground)
+            },
+            modifier = Modifier.weight(1f),
+            gap = 14.dp,
+        )
     }
 }
 

@@ -82,6 +82,7 @@ import com.tally.app.ui.common.CategoryIcons
 import com.tally.app.ui.common.ChromeButton
 import com.tally.app.ui.common.Dates
 import com.tally.app.ui.common.GUTTER
+import com.tally.app.ui.common.HeroNumber
 import com.tally.app.ui.common.GlyphBadge
 import com.tally.app.ui.common.Group
 import com.tally.app.ui.common.GroupFooter
@@ -103,7 +104,6 @@ import com.tally.app.ui.nav.AppNav
 import com.tally.app.ui.settings.COMMON_CURRENCIES
 import com.tally.app.ui.settings.CurrencyRow
 import com.tally.app.ui.settings.HeroHead
-import com.tally.app.ui.settings.HeroNumber
 import com.tally.app.ui.settings.RowBadge
 import com.tally.app.ui.settings.currencyOption
 import com.tally.app.ui.settings.onboardingCurrencyCodes

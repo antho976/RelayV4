@@ -39,6 +39,7 @@ import com.tally.app.ui.common.ChoiceChip
 import com.tally.app.ui.common.ChoiceRow
 import com.tally.app.ui.common.Dates
 import com.tally.app.ui.common.GUTTER
+import com.tally.app.ui.common.HeroNumber
 import com.tally.app.ui.common.Group
 import com.tally.app.ui.common.GroupRow
 import com.tally.app.ui.common.HeroPanel

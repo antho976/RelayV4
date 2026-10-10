@@ -227,8 +227,9 @@ fun StatChip(icon: ImageVector, text: String, modifier: Modifier = Modifier) {
 /**
  * Spend per day as rounded bars with the daily allowance as a dashed line: the week (or any short
  * run of days) at a glance. [highlight] is today's index, drawn in the accent; past days take the
- * secondary rung; days still ahead draw as empty stubs. Bars over the allowance take the error
- * colour, a true state.
+ * secondary rung; days still ahead draw as empty stubs. A day over its allowance keeps its own
+ * colour up to the line and draws only what went past it in the error colour, a gap apart: "over"
+ * is a visible length, as on the pace meter, never a whole bar turned red.
  *
  * The first [beforeCount] days fall before the period began (a week can open in last month):
  * they draw in the muted rung, initials dimmed, and are never held to this period's allowance.
@@ -269,11 +270,18 @@ fun DayBars(
                 if (h <= 0f) return@forEachIndexed
                 val color = when {
                     i < beforeCount -> before
-                    allowance != null && allowance > 0 && v > allowance -> over
                     i == highlight -> accent
                     else -> past
                 }
-                drawRoundRect(color, topLeft = Offset(x, size.height - h), size = Size(barW, h), cornerRadius = r)
+                // The days before the period are never held to this period's allowance.
+                val line = if (i >= beforeCount && allowance != null && allowance > 0) size.height * (allowance / max) else null
+                if (line == null || h <= line) {
+                    drawRoundRect(color, topLeft = Offset(x, size.height - h), size = Size(barW, h), cornerRadius = r)
+                } else {
+                    drawRoundRect(color, topLeft = Offset(x, size.height - line), size = Size(barW, line), cornerRadius = r)
+                    val beyond = h - line - 1.5.dp.toPx()
+                    if (beyond > 0f) drawRoundRect(over, topLeft = Offset(x, size.height - h), size = Size(barW, beyond), cornerRadius = r)
+                }
             }
             if (allowance != null && allowance > 0) {
                 val y = size.height * (1f - allowance / max)

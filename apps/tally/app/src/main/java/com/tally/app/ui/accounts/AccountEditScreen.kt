@@ -62,6 +62,7 @@ import com.tally.app.ui.common.ChromeButton
 import com.tally.app.ui.common.Dates
 import com.tally.app.ui.common.GlyphBadge
 import com.tally.app.ui.common.GUTTER
+import com.tally.app.ui.common.HeroNumber
 import com.tally.app.ui.common.Group
 import com.tally.app.ui.common.GroupBlock
 import com.tally.app.ui.common.GroupRow
@@ -81,10 +82,13 @@ import com.tally.app.ui.common.bounceClick
 import com.tally.app.ui.common.refusalLine
 import com.tally.app.ui.common.selectableColors
 import com.tally.app.ui.common.slab
+import com.tally.app.ui.invest.REGISTRATION_CHOICES
+import com.tally.app.ui.invest.registrationLabel
 import com.tally.app.ui.nav.AppNav
 import com.tally.app.data.db.AccountValueEntity
 import com.tally.core.AccountType
 import com.tally.core.Copy
+import com.tally.core.Registration
 import java.time.LocalDate
 
 @Composable
@@ -97,6 +101,7 @@ fun AccountEditRoute(nav: AppNav) {
             back = nav::back,
             setName = viewModel::setName,
             setType = viewModel::setType,
+            setRegistration = viewModel::setRegistration,
             applyTemplate = viewModel::applyTemplate,
             recordValue = viewModel::recordValue,
             deleteValue = viewModel::deleteValue,
@@ -120,6 +125,8 @@ data class AccountEditActions(
     val back: () -> Unit = {},
     val setName: (String) -> Unit = {},
     val setType: (AccountType) -> Unit = {},
+    /** An investment account's kind: TFSA, RRSP, FHSA, non-registered... */
+    val setRegistration: (Registration?) -> Unit = {},
     val applyTemplate: (AccountTemplate) -> Unit = {},
     /** Records an investment account's value today. */
     val recordValue: (Long) -> Unit = {},
@@ -170,6 +177,7 @@ fun AccountEditScreen(state: AccountEditState, actions: AccountEditActions) {
                 if (state.isNew && state.templates.isNotEmpty()) QuickStartGroup(state, actions)
                 NameGroup(state, actions)
                 TypeGroup(d.type, actions.setType)
+                if (d.type == AccountType.INVESTMENT) RegistrationGroup(d.registration, actions.setRegistration)
                 OpeningGroup(state, actions)
                 if (!state.isNew && d.type == AccountType.INVESTMENT) ValueGroup(state, actions)
                 UseGroup(d, actions)
@@ -377,6 +385,31 @@ private fun TypeRow(type: AccountType, selected: Boolean, shape: Shape, onClick:
             Icon(Icons.Rounded.Check, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
         }
     }
+}
+
+/**
+ * An investment account's kind, as one row of choices: what decides whether its deposits count
+ * against this year's TFSA, RRSP or FHSA room on Investments. An import sets it from the file.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun RegistrationGroup(selected: Registration?, onPick: (Registration?) -> Unit) {
+    val block: @Composable (Shape) -> Unit = { shape ->
+        GroupBlock(shape) {
+            FlowRow(Modifier.fillMaxWidth().selectableGroup(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                REGISTRATION_CHOICES.forEach { r -> ChoiceChip(registrationLabel(r), r == selected) { onPick(r) } }
+            }
+        }
+    }
+    Group(
+        rows = listOf(block),
+        title = "Kind",
+        footer = if (selected == null) {
+            "Pick one so its deposits count against the right room on Investments"
+        } else {
+            "Deposits into a TFSA, an RRSP or an FHSA count against this year's room on Investments"
+        },
+    )
 }
 
 /** The opening amount; a card (or anything opening below zero) also says whether it is owed. */

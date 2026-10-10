@@ -38,6 +38,19 @@ pub fn pace_line(r: &PaceReading, fmt: &MoneyFormatter) -> String {
     }
 }
 
+/// The pace verdict in days: how many days of an even spend the month runs ahead of, or has in
+/// hand. Never zero days: a reading off pace is at least one day off it.
+pub fn days_line(r: &PaceReading) -> String {
+    let days = || crate::invest::mul_div_half_even(r.pace_delta.abs(), r.total_days, r.budget).unwrap_or(0).max(1);
+    match r.status {
+        PaceStatus::NoBudget => String::new(),
+        PaceStatus::OverBudget => "Over budget".to_string(),
+        PaceStatus::OnPace => "On pace".to_string(),
+        PaceStatus::OverPace => format!("{} ahead of your money", plural(days(), "day")),
+        PaceStatus::UnderPace => format!("{} of room in hand", plural(days(), "day")),
+    }
+}
+
 /// One envelope's reading, for a budget row: "$212 of $300".
 pub fn of_budget(spent: i64, budget: i64, fmt: &MoneyFormatter) -> String {
     format!("{} of {}", fmt.format_whole(spent), fmt.format_whole(budget))
@@ -132,6 +145,26 @@ mod tests {
     }
 
     #[test]
+    fn days_line_counts_the_days_spending_runs_ahead_of_an_even_pace() {
+        // 3,100 over 31 days is 100 a day; by day 10 an even spend is 1,000.
+        assert_eq!("4 days ahead of your money", days_line(&PaceReading::new(310_000, 140_000, 31, 10)));
+        assert_eq!("1 day ahead of your money", days_line(&PaceReading::new(310_000, 108_000, 31, 10)));
+    }
+
+    #[test]
+    fn days_line_counts_the_days_of_room_in_hand() {
+        assert_eq!("3 days of room in hand", days_line(&PaceReading::new(310_000, 70_000, 31, 10)));
+        assert_eq!("1 day of room in hand", days_line(&PaceReading::new(310_000, 92_000, 31, 10)));
+    }
+
+    #[test]
+    fn days_line_says_nothing_without_a_budget() {
+        assert_eq!("", days_line(&PaceReading::new(0, 10_000, 31, 10)));
+        assert_eq!("On pace", days_line(&PaceReading::new(310_000, 100_000, 31, 10)));
+        assert_eq!("Over budget", days_line(&PaceReading::new(100_00, 130_00, 30, 20)));
+    }
+
+    #[test]
     fn no_generated_line_breaks_the_voice_rules() {
         let f = fmt();
         let readings = [
@@ -139,7 +172,7 @@ mod tests {
             PaceReading::new(310_00, 10_00, 31, 10), PaceReading::new(100_00, 300_00, 31, 31),
             PaceReading::new(0, 10_00, 31, 10),
         ];
-        let mut lines: Vec<String> = readings.iter().flat_map(|r| [margin_line(r, &f), pace_line(r, &f)]).collect();
+        let mut lines: Vec<String> = readings.iter().flat_map(|r| [margin_line(r, &f), pace_line(r, &f), days_line(r)]).collect();
         lines.extend([due_line(-3), due_line(0), due_line(1), due_line(9)]);
         lines.extend([versus_last_line(10, 0, &f), versus_last_line(10, 20, &f), versus_last_line(30, 20, &f)]);
         for line in &lines {

@@ -15,8 +15,17 @@ import androidx.sqlite.db.SupportSQLiteDatabase
  */
 object SyncSchema {
 
+    /**
+     * The tables version 3 synced. MIGRATION_2_3 works on exactly these: a table that came later
+     * does not exist yet when it runs.
+     */
+    private val TABLES_V3 = listOf("accounts", "categories", "recurring", "goals", "transactions", "budgets", "goal_contributions", "account_values")
+
+    /** The investment tables version 4 added (docs/INVESTMENTS.md), what they refer to first. */
+    private val TABLES_V4 = listOf("securities", "holdings", "activities", "prices", "fx_rates", "room_facts")
+
     /** The synced Room tables, by their SQL name, in the order the PC applies them. */
-    val TABLES = listOf("accounts", "categories", "recurring", "goals", "transactions", "budgets", "goal_contributions", "account_values")
+    val TABLES = TABLES_V3 + TABLES_V4
 
     /*
      * Android builds SQLite with recursive triggers on, so a trigger's own write can fire it
@@ -85,8 +94,8 @@ object SyncSchema {
 
     private val SUFFIXES = listOf("sync_insert", "sync_update", "sync_uid", "sync_delete")
 
-    fun createTriggers(db: SupportSQLiteDatabase) {
-        TABLES.forEach { table -> triggers(table).forEach(db::execSQL) }
+    fun createTriggers(db: SupportSQLiteDatabase, tables: List<String> = TABLES) {
+        tables.forEach { table -> triggers(table).forEach(db::execSQL) }
     }
 
     /**
@@ -116,7 +125,7 @@ object SyncSchema {
      */
     val MIGRATION_2_3 = object : Migration(2, 3) {
         override fun migrate(db: SupportSQLiteDatabase) {
-            TABLES.forEach { table ->
+            TABLES_V3.forEach { table ->
                 db.execSQL("ALTER TABLE `$table` ADD COLUMN `uid` TEXT NOT NULL DEFAULT ''")
                 db.execSQL("ALTER TABLE `$table` ADD COLUMN `updatedAt` INTEGER NOT NULL DEFAULT 0")
                 db.execSQL("UPDATE `$table` SET uid = $UUID_SQL, updatedAt = $NOW")
@@ -128,11 +137,73 @@ object SyncSchema {
             )
             db.execSQL("CREATE INDEX IF NOT EXISTS `index_sync_tombstones_deletedAt` ON `sync_tombstones` (`deletedAt`)")
             db.execSQL("CREATE TABLE IF NOT EXISTS `sync_state` (`key` TEXT NOT NULL, `value` INTEGER NOT NULL, PRIMARY KEY(`key`))")
-            createTriggers(db)
+            createTriggers(db, TABLES_V3)
+        }
+    }
+
+    /**
+     * 4: investments (docs/INVESTMENTS.md). Accounts gain a registration, an institution and the
+     * institution's number, read as none and empty on every account there is; six new tables
+     * come with their indices and triggers. The statements are the ones Room writes for the
+     * entities (schemas/4.json), so a migrated ledger and a fresh install are the same database.
+     */
+    val MIGRATION_3_4 = object : Migration(3, 4) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `accounts` ADD COLUMN `registration` TEXT")
+            db.execSQL("ALTER TABLE `accounts` ADD COLUMN `institution` TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE `accounts` ADD COLUMN `externalRef` TEXT NOT NULL DEFAULT ''")
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `securities` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `symbol` TEXT NOT NULL, " +
+                    "`name` TEXT NOT NULL, `currency` TEXT NOT NULL, `kind` TEXT NOT NULL, `exchange` TEXT NOT NULL, " +
+                    "`uid` TEXT NOT NULL, `updatedAt` INTEGER NOT NULL)"
+            )
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_securities_uid` ON `securities` (`uid`)")
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `holdings` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `accountId` INTEGER NOT NULL, " +
+                    "`securityId` INTEGER NOT NULL, `date` INTEGER NOT NULL, `quantity` INTEGER NOT NULL, `book` INTEGER NOT NULL, " +
+                    "`bookMarket` INTEGER NOT NULL, `uid` TEXT NOT NULL, `updatedAt` INTEGER NOT NULL, " +
+                    "FOREIGN KEY(`accountId`) REFERENCES `accounts`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE , " +
+                    "FOREIGN KEY(`securityId`) REFERENCES `securities`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )"
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_holdings_accountId_date` ON `holdings` (`accountId`, `date`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_holdings_securityId` ON `holdings` (`securityId`)")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_holdings_uid` ON `holdings` (`uid`)")
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `activities` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `accountId` INTEGER NOT NULL, " +
+                    "`securityId` INTEGER, `type` TEXT NOT NULL, `date` INTEGER NOT NULL, `quantity` INTEGER NOT NULL, " +
+                    "`amount` INTEGER NOT NULL, `fee` INTEGER NOT NULL, `currency` TEXT NOT NULL, `toAmount` INTEGER, " +
+                    "`toCurrency` TEXT, `note` TEXT NOT NULL, `source` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, " +
+                    "`uid` TEXT NOT NULL, `updatedAt` INTEGER NOT NULL, " +
+                    "FOREIGN KEY(`accountId`) REFERENCES `accounts`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE , " +
+                    "FOREIGN KEY(`securityId`) REFERENCES `securities`(`id`) ON UPDATE NO ACTION ON DELETE SET NULL )"
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_activities_accountId_date` ON `activities` (`accountId`, `date`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_activities_securityId` ON `activities` (`securityId`)")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_activities_uid` ON `activities` (`uid`)")
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `prices` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `securityId` INTEGER NOT NULL, " +
+                    "`date` INTEGER NOT NULL, `price` INTEGER NOT NULL, `source` TEXT NOT NULL, `uid` TEXT NOT NULL, " +
+                    "`updatedAt` INTEGER NOT NULL, " +
+                    "FOREIGN KEY(`securityId`) REFERENCES `securities`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )"
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_prices_securityId_date` ON `prices` (`securityId`, `date`)")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_prices_uid` ON `prices` (`uid`)")
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `fx_rates` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `base` TEXT NOT NULL, " +
+                    "`quote` TEXT NOT NULL, `date` INTEGER NOT NULL, `rate` INTEGER NOT NULL, `source` TEXT NOT NULL, " +
+                    "`uid` TEXT NOT NULL, `updatedAt` INTEGER NOT NULL)"
+            )
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_fx_rates_uid` ON `fx_rates` (`uid`)")
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `room_facts` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `registration` TEXT NOT NULL, " +
+                    "`year` INTEGER NOT NULL, `amount` INTEGER NOT NULL, `uid` TEXT NOT NULL, `updatedAt` INTEGER NOT NULL)"
+            )
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_room_facts_uid` ON `room_facts` (`uid`)")
+            createTriggers(db, TABLES_V4)
         }
     }
 }
 
 /** The one place a [TallyDatabase] builder is finished, so the app and every test get the same database. */
 fun RoomDatabase.Builder<TallyDatabase>.tally(): RoomDatabase.Builder<TallyDatabase> =
-    addMigrations(SyncSchema.MIGRATION_2_3).addCallback(SyncSchema.callback)
+    addMigrations(SyncSchema.MIGRATION_2_3, SyncSchema.MIGRATION_3_4).addCallback(SyncSchema.callback)

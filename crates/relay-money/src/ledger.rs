@@ -7,11 +7,12 @@
 //! here shows the numbers the phone shows.
 
 use crate::backup::{
-    AccountDto, AccountValueDto, BackupFile, BudgetDto, CategoryDto, ContributionDto, GoalDto, RecurringDto,
-    TransactionDto,
+    AccountDto, AccountValueDto, ActivityDto, BackupFile, BudgetDto, CategoryDto, ContributionDto, FxRateDto, GoalDto, HoldingDto,
+    PriceDto, RecurringDto, RoomFactDto, SecurityDto, TransactionDto,
 };
 use crate::copy;
-use crate::model::{AccountType, CategoryKind, GoalKind, TxType, DEFAULT_CATEGORIES};
+use crate::csv::kt_is_blank;
+use crate::model::{AccountType, ActivityType, CategoryKind, GoalKind, Registration, SecurityKind, TxType, DEFAULT_CATEGORIES};
 use crate::money::{fraction_digits, Locale, MoneyFormatter};
 use crate::pace::PaceReading;
 use crate::period::{days_between, BudgetPeriod};
@@ -22,10 +23,11 @@ use jiff::civil::Date;
 use jiff::ToSpan;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Bumped with every entry appended to [`MIGRATIONS`]; every earlier version must stay openable.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const MIGRATIONS: &[&str] = &[r"
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -144,10 +146,82 @@ UPDATE settings SET seq = 0;
 ", r"
 -- A budget's tombstone names its category's uid: budgets are matched by category on sync.
 ALTER TABLE tombstones ADD COLUMN category TEXT;
+", r"
+-- Investments (docs/INVESTMENTS.md). An investment account's registration (null on the others),
+-- its institution and the institution's own number for it; then what is held, what was done,
+-- prices, rates and the CRA's room figures. Positions, value and room are read from these, never stored.
+ALTER TABLE accounts ADD COLUMN registration TEXT;
+ALTER TABLE accounts ADD COLUMN institution TEXT NOT NULL DEFAULT '';
+ALTER TABLE accounts ADD COLUMN external_ref TEXT NOT NULL DEFAULT '';
+CREATE TABLE securities (
+    id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, symbol TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+    currency TEXT NOT NULL, kind TEXT NOT NULL, exchange TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+-- A snapshot: an account's holdings are its rows on their newest date. `book` is in the ledger
+-- currency, `book_market` in the security's; `quantity` at 1e-8 of a unit.
+CREATE TABLE holdings (
+    id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, account_id INTEGER NOT NULL, security_id INTEGER NOT NULL,
+    date TEXT NOT NULL, quantity INTEGER NOT NULL, book INTEGER NOT NULL, book_market INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX holdings_account ON holdings (account_id, date);
+-- Never `transactions`: buys, sells and dividends are not spending or income.
+CREATE TABLE activities (
+    id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, account_id INTEGER NOT NULL, security_id INTEGER,
+    type TEXT NOT NULL, date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 0, amount INTEGER NOT NULL,
+    fee INTEGER NOT NULL DEFAULT 0, currency TEXT NOT NULL, to_amount INTEGER, to_currency TEXT,
+    note TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'MANUAL', created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX activities_account ON activities (account_id, date);
+CREATE TABLE prices (
+    id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, security_id INTEGER NOT NULL, date TEXT NOT NULL,
+    price INTEGER NOT NULL, source TEXT NOT NULL,
+    updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX prices_security ON prices (security_id, date);
+CREATE TABLE fx_rates (
+    id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, base TEXT NOT NULL, quote TEXT NOT NULL, date TEXT NOT NULL,
+    rate INTEGER NOT NULL, source TEXT NOT NULL,
+    updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE room_facts (
+    id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, registration TEXT NOT NULL, year INTEGER NOT NULL,
+    amount INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+-- Sync numbers every change to these as migration 2 numbers the first eight.
+CREATE INDEX securities_seq ON securities (seq);
+CREATE TRIGGER securities_seq_insert AFTER INSERT ON securities BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE securities SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER securities_seq_update AFTER UPDATE ON securities WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE securities SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE INDEX holdings_seq ON holdings (seq);
+CREATE TRIGGER holdings_seq_insert AFTER INSERT ON holdings BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE holdings SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER holdings_seq_update AFTER UPDATE ON holdings WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE holdings SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE INDEX activities_seq ON activities (seq);
+CREATE TRIGGER activities_seq_insert AFTER INSERT ON activities BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE activities SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER activities_seq_update AFTER UPDATE ON activities WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE activities SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE INDEX prices_seq ON prices (seq);
+CREATE TRIGGER prices_seq_insert AFTER INSERT ON prices BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE prices SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER prices_seq_update AFTER UPDATE ON prices WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE prices SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE INDEX fx_rates_seq ON fx_rates (seq);
+CREATE TRIGGER fx_rates_seq_insert AFTER INSERT ON fx_rates BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE fx_rates SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER fx_rates_seq_update AFTER UPDATE ON fx_rates WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE fx_rates SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE INDEX room_facts_seq ON room_facts (seq);
+CREATE TRIGGER room_facts_seq_insert AFTER INSERT ON room_facts BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE room_facts SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER room_facts_seq_update AFTER UPDATE ON room_facts WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE room_facts SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
 "];
 
-const TABLES: [&str; 8] =
-    ["accounts", "categories", "transactions", "budgets", "recurring", "goals", "contributions", "account_values"];
+const TABLES: [&str; 14] = [
+    "accounts", "categories", "transactions", "budgets", "recurring", "goals", "contributions", "account_values",
+    "securities", "holdings", "activities", "prices", "fx_rates", "room_facts",
+];
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -179,23 +253,23 @@ impl From<rusqlite::Error> for LedgerError {
 
 pub type Result<T> = std::result::Result<T, LedgerError>;
 
-fn invalid<T>(m: impl Into<String>) -> Result<T> {
+pub(crate) fn invalid<T>(m: impl Into<String>) -> Result<T> {
     Err(LedgerError::Invalid(m.into()))
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     jiff::Timestamp::now().as_millisecond()
 }
 
-fn new_uid() -> String {
+pub(crate) fn new_uid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-fn name_of<T: Serialize>(v: &T) -> String {
+pub(crate) fn name_of<T: Serialize>(v: &T) -> String {
     serde_json::to_value(v).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
 
-fn parse_name<T: for<'de> Deserialize<'de>>(s: &str) -> Option<T> {
+pub(crate) fn parse_name<T: for<'de> Deserialize<'de>>(s: &str) -> Option<T> {
     serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
 }
 
@@ -296,7 +370,8 @@ impl Ledger {
                     + COALESCE((SELECT SUM(CASE WHEN t.type = 'INCOME' THEN t.amount ELSE -t.amount END)
                                 FROM transactions t WHERE t.deleted = 0 AND t.account_id = a.id AND (v.date IS NULL OR t.date > v.date)), 0)
                     + COALESCE((SELECT SUM(t.amount) FROM transactions t
-                                WHERE t.deleted = 0 AND t.type = 'TRANSFER' AND t.to_account_id = a.id AND (v.date IS NULL OR t.date > v.date)), 0)
+                                WHERE t.deleted = 0 AND t.type = 'TRANSFER' AND t.to_account_id = a.id AND (v.date IS NULL OR t.date > v.date)), 0),
+                    a.registration, a.institution
              FROM accounts a
              LEFT JOIN account_values v ON v.id = (
                  SELECT v2.id FROM account_values v2 WHERE v2.deleted = 0 AND v2.account_id = a.id ORDER BY v2.date DESC, v2.id DESC LIMIT 1)
@@ -310,6 +385,8 @@ impl Ledger {
                 r#type: parse_name(&r.get::<_, String>(2)?).unwrap_or(AccountType::Chequing),
                 archived: r.get(3)?,
                 balance: r.get(4)?,
+                registration: r.get::<_, Option<String>>(5)?.as_deref().and_then(parse_name),
+                institution: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -798,12 +875,22 @@ impl Ledger {
     }
 
     /// Replaces the whole ledger with a Tally backup, as a restore does on the phone. Ids are kept
-    /// so references hold; every row gets a fresh uid.
+    /// so references hold. Accounts and investment rows keep the uid the file gives them (an
+    /// import's `ws:`, `sec:`, `imp:`… uids, so the same Wealthsimple file imported again adds
+    /// nothing); every other row, and one whose uid is blank or already taken in the file, gets a
+    /// fresh one.
     pub fn import_backup(&mut self, file: &BackupFile) -> Result<usize> {
         if let Some(problem) = crate::backup::problem(file) {
             return invalid(problem);
         }
         let now = now_ms();
+        let mut taken: HashSet<(&str, String)> = HashSet::new();
+        let mut uid = |table: &'static str, kept: &Option<String>| -> String {
+            match kept.as_deref().filter(|u| !kt_is_blank(u)) {
+                Some(u) if taken.insert((table, u.to_string())) => u.to_string(),
+                _ => new_uid(),
+            }
+        };
         let tx = self.conn.transaction()?;
         Ledger::clear(&tx, false)?;
         Ledger::set_setting(&tx, "currency", &file.currency)?;
@@ -814,8 +901,13 @@ impl Ledger {
             Ledger::set_setting(&tx, "week_starts_monday", if m { "1" } else { "0" })?;
         }
         for a in &file.accounts {
-            tx.prepare_cached("INSERT INTO accounts (id, uid, name, type, opening_balance, archived, sort_order, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?
-                .execute(params![a.id, new_uid(), a.name, name_of(&a.r#type), a.opening_balance, a.archived, a.sort_order, now])?;
+            tx.prepare_cached(
+                "INSERT INTO accounts (id, uid, name, type, opening_balance, archived, sort_order, registration, institution, external_ref, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            )?.execute(params![
+                a.id, uid("accounts", &a.uid), a.name, name_of(&a.r#type), a.opening_balance, a.archived, a.sort_order,
+                a.registration.as_ref().map(name_of), a.institution, a.external_ref, now
+            ])?;
         }
         for c in &file.categories {
             tx.prepare_cached("INSERT INTO categories (id, uid, name, kind, color, icon, archived, sort_order, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)")?
@@ -857,6 +949,41 @@ impl Ledger {
             tx.prepare_cached("INSERT INTO account_values (id, uid, account_id, date, value, updated_at) VALUES (?1,?2,?3,?4,?5,?6)")?
                 .execute(params![v.id, new_uid(), v.account_id, v.date, v.value, now])?;
         }
+        for s in &file.securities {
+            tx.prepare_cached("INSERT INTO securities (id, uid, symbol, name, currency, kind, exchange, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?
+                .execute(params![s.id, uid("securities", &s.uid), s.symbol, s.name, s.currency, name_of(&s.kind), s.exchange, now])?;
+        }
+        for h in &file.holdings {
+            tx.prepare_cached(
+                "INSERT INTO holdings (id, uid, account_id, security_id, date, quantity, book, book_market, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            )?.execute(params![h.id, uid("holdings", &h.uid), h.account_id, h.security_id, h.date, h.quantity, h.book, h.book_market, now])?;
+        }
+        for a in &file.activities {
+            tx.prepare_cached(
+                "INSERT INTO activities (id, uid, account_id, security_id, type, date, quantity, amount, fee, currency, to_amount, to_currency, note, source, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
+            )?.execute(params![
+                a.id, uid("activities", &a.uid), a.account_id, a.security_id, name_of(&a.r#type), a.date, a.quantity, a.amount, a.fee, a.currency,
+                a.to_amount, a.to_currency, a.note, a.source, now
+            ])?;
+        }
+        for p in &file.prices {
+            tx.prepare_cached("INSERT INTO prices (id, uid, security_id, date, price, source, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)")?
+                .execute(params![p.id, uid("prices", &p.uid), p.security_id, p.date, p.price, p.source, now])?;
+        }
+        for r in &file.fx_rates {
+            tx.prepare_cached("INSERT INTO fx_rates (id, uid, base, quote, date, rate, source, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?
+                .execute(params![r.id, uid("fx_rates", &r.uid), r.base, r.quote, r.date, r.rate, r.source, now])?;
+        }
+        for r in &file.room_facts {
+            tx.prepare_cached("INSERT INTO room_facts (id, uid, registration, year, amount, updated_at) VALUES (?1,?2,?3,?4,?5,?6)")?
+                .execute(params![r.id, uid("room_facts", &r.uid), name_of(&r.registration), r.year, r.amount, now])?;
+        }
+        // A kept uid is live again: the tombstone the erase above left for it must not travel and
+        // erase the restored row on the phone.
+        for t in TABLES {
+            tx.execute(&format!("DELETE FROM tombstones WHERE tbl = '{t}' AND uid IN (SELECT uid FROM {t})"), [])?;
+        }
         tx.commit()?;
         Ok(file.transactions.len())
     }
@@ -873,8 +1000,12 @@ impl Ledger {
             let rows = st.query_map([], f)?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
         }
-        file.accounts = all(c, "SELECT id, name, type, opening_balance, archived, sort_order FROM accounts WHERE deleted = 0 ORDER BY id", |r| {
-            Ok(AccountDto { id: r.get(0)?, name: r.get(1)?, r#type: parse_name(&r.get::<_, String>(2)?).unwrap_or(AccountType::Chequing), opening_balance: r.get(3)?, archived: r.get(4)?, sort_order: r.get(5)? })
+        file.accounts = all(c, "SELECT id, name, type, opening_balance, archived, sort_order, registration, institution, external_ref, uid FROM accounts WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(AccountDto {
+                id: r.get(0)?, name: r.get(1)?, r#type: parse_name(&r.get::<_, String>(2)?).unwrap_or(AccountType::Chequing), opening_balance: r.get(3)?,
+                archived: r.get(4)?, sort_order: r.get(5)?, registration: r.get::<_, Option<String>>(6)?.as_deref().and_then(parse_name),
+                institution: r.get(7)?, external_ref: r.get(8)?, uid: r.get(9)?,
+            })
         })?;
         file.categories = all(c, "SELECT id, name, kind, color, icon, archived, sort_order FROM categories WHERE deleted = 0 ORDER BY id", |r| {
             Ok(CategoryDto { id: r.get(0)?, name: r.get(1)?, kind: parse_name(&r.get::<_, String>(2)?).unwrap_or(CategoryKind::Expense), color: r.get(3)?, icon: r.get(4)?, archived: r.get(5)?, sort_order: r.get(6)? })
@@ -912,6 +1043,37 @@ impl Ledger {
         file.values = all(c, "SELECT id, account_id, date, value FROM account_values WHERE deleted = 0 ORDER BY id", |r| {
             Ok(AccountValueDto { id: r.get(0)?, account_id: r.get(1)?, date: r.get(2)?, value: r.get(3)? })
         })?;
+        file.securities = all(c, "SELECT id, symbol, name, currency, kind, exchange, uid FROM securities WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(SecurityDto {
+                id: r.get(0)?, symbol: r.get(1)?, name: r.get(2)?, currency: r.get(3)?,
+                kind: parse_name(&r.get::<_, String>(4)?).unwrap_or(SecurityKind::Other), exchange: r.get(5)?, uid: r.get(6)?,
+            })
+        })?;
+        file.holdings = all(c, "SELECT id, account_id, security_id, date, quantity, book, book_market, uid FROM holdings WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(HoldingDto {
+                id: r.get(0)?, account_id: r.get(1)?, security_id: r.get(2)?, date: r.get(3)?, quantity: r.get(4)?, book: r.get(5)?, book_market: r.get(6)?,
+                uid: r.get(7)?,
+            })
+        })?;
+        file.activities = all(c, "SELECT id, account_id, security_id, type, date, quantity, amount, fee, currency, to_amount, to_currency, note, source, uid FROM activities WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(ActivityDto {
+                id: r.get(0)?, account_id: r.get(1)?, security_id: r.get(2)?, r#type: parse_name(&r.get::<_, String>(3)?).unwrap_or(ActivityType::Deposit),
+                date: r.get(4)?, quantity: r.get(5)?, amount: r.get(6)?, fee: r.get(7)?, currency: r.get(8)?, to_amount: r.get(9)?,
+                to_currency: r.get(10)?, note: r.get(11)?, source: r.get(12)?, uid: r.get(13)?,
+            })
+        })?;
+        file.prices = all(c, "SELECT id, security_id, date, price, source, uid FROM prices WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(PriceDto { id: r.get(0)?, security_id: r.get(1)?, date: r.get(2)?, price: r.get(3)?, source: r.get(4)?, uid: r.get(5)? })
+        })?;
+        file.fx_rates = all(c, "SELECT id, base, quote, date, rate, source, uid FROM fx_rates WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(FxRateDto { id: r.get(0)?, base: r.get(1)?, quote: r.get(2)?, date: r.get(3)?, rate: r.get(4)?, source: r.get(5)?, uid: r.get(6)? })
+        })?;
+        file.room_facts = all(c, "SELECT id, registration, year, amount, uid FROM room_facts WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(RoomFactDto {
+                id: r.get(0)?, registration: parse_name(&r.get::<_, String>(1)?).unwrap_or(Registration::Other), year: r.get(2)?, amount: r.get(3)?,
+                uid: r.get(4)?,
+            })
+        })?;
         Ok(file)
     }
 
@@ -939,15 +1101,23 @@ impl Ledger {
         Ok(())
     }
 
-    /// Adds an account; the first one a person makes on the PC.
-    pub fn account_add(&mut self, name: &str, ty: AccountType, opening_balance: i64) -> Result<AccountView> {
+    /// Adds an account; the first one a person makes on the PC. Only an investment account takes a
+    /// registration.
+    pub fn account_add(
+        &mut self, name: &str, ty: AccountType, opening_balance: i64, registration: Option<Registration>, institution: &str,
+    ) -> Result<AccountView> {
         let name = name.trim();
         if name.is_empty() {
             return invalid("An account needs a name");
         }
+        if registration.is_some() && ty != AccountType::Investment {
+            return invalid("Only an investment account has a registration");
+        }
+        let registration = registration.map(|r| name_of(&r));
         let order: i64 = self.conn.prepare_cached("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM accounts")?.query_row([], |r| r.get(0))?;
-        self.conn.prepare_cached("INSERT INTO accounts (uid, name, type, opening_balance, sort_order, updated_at) VALUES (?1,?2,?3,?4,?5,?6)")?
-            .execute(params![new_uid(), name, name_of(&ty), opening_balance, order, now_ms()])?;
+        self.conn.prepare_cached(
+            "INSERT INTO accounts (uid, name, type, opening_balance, sort_order, registration, institution, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        )?.execute(params![new_uid(), name, name_of(&ty), opening_balance, order, registration, institution.trim(), now_ms()])?;
         let id = self.conn.last_insert_rowid();
         self.ensure_categories()?;
         self.accounts()?.into_iter().find(|a| a.id == id).ok_or_else(|| LedgerError::NotFound("account".into()))
@@ -998,7 +1168,7 @@ mod tests {
 
     fn with_account() -> (Ledger, i64) {
         let mut l = Ledger::open_in_memory().unwrap();
-        let a = l.account_add("Chequing", AccountType::Chequing, 1_000_00).unwrap();
+        let a = l.account_add("Chequing", AccountType::Chequing, 1_000_00, None, "").unwrap();
         (l, a.id)
     }
 
@@ -1040,7 +1210,7 @@ mod tests {
     #[test]
     fn a_transfer_moves_money_without_counting_as_spending() {
         let (mut l, acct) = with_account();
-        let savings = l.account_add("Savings", AccountType::Savings, 0).unwrap().id;
+        let savings = l.account_add("Savings", AccountType::Savings, 0, None, "").unwrap().id;
         l.tx_add(&TxInput { r#type: TxType::Transfer, amount: 200_00, date: "2026-10-02".into(), account_id: acct, to_account_id: Some(savings), category_id: None, note: None }).unwrap();
         let s = l.summary(date(2026, 10, 3), &en()).unwrap();
         assert_eq!(s.spent, 0);
@@ -1104,10 +1274,19 @@ mod tests {
         sample.goals.sort_by_key(|r| r.id);
         sample.contributions.sort_by_key(|r| r.id);
         sample.values.sort_by_key(|r| r.id);
+        sample.securities.sort_by_key(|r| r.id);
+        sample.holdings.sort_by_key(|r| r.id);
+        sample.activities.sort_by_key(|r| r.id);
+        sample.prices.sort_by_key(|r| r.id);
+        sample.fx_rates.sort_by_key(|r| r.id);
+        sample.room_facts.sort_by_key(|r| r.id);
         let mut back = l.export_backup(&sample.exported_at).unwrap();
         // The backup does not say these for the sample; the ledger writes its own.
         back.month_start_day = sample.month_start_day;
         back.week_starts_monday = sample.week_starts_monday;
+        // Nor its accounts' uids, which the ledger made when it loaded the sample.
+        assert!(back.accounts.iter().all(|a| a.uid.as_deref().is_some_and(|u| !u.is_empty())));
+        back.accounts.iter_mut().for_each(|a| a.uid = None);
         let (got, want) = (crate::backup::encode(&back), crate::backup::encode(&sample));
         if got != want {
             let _ = std::fs::write(std::env::temp_dir().join("ledger-got.json"), &got);
@@ -1152,7 +1331,7 @@ mod tests {
     #[test]
     fn a_recorded_value_resets_an_investment_balance() {
         let (mut l, acct) = with_account();
-        let tfsa = l.account_add("TFSA", AccountType::Investment, 5_000_00).unwrap().id;
+        let tfsa = l.account_add("TFSA", AccountType::Investment, 5_000_00, Some(Registration::Tfsa), "Wealthsimple").unwrap().id;
         let mut file = l.export_backup("x").unwrap();
         file.values.push(AccountValueDto { id: 1, account_id: tfsa, date: "2026-10-01".into(), value: 6_000_00 });
         file.transactions.push(TransactionDto { id: 1, r#type: TxType::Transfer, amount: 100_00, date: "2026-09-15".into(), account_id: acct, to_account_id: Some(tfsa), category_id: None, note: String::new(), recurring_id: None });
@@ -1187,13 +1366,50 @@ mod tests {
     }
 
     #[test]
+    fn every_migration_has_its_version() {
+        assert_eq!(SCHEMA_VERSION as usize, MIGRATIONS.len());
+    }
+
+    #[test]
+    fn a_version_3_ledger_opens_with_everything_in_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..3] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO settings (key, value) VALUES ('currency', 'CAD');
+             INSERT INTO accounts (uid, name, type, opening_balance, updated_at) VALUES ('a1', 'Chequing', 'CHEQUING', 100000, 1);
+             INSERT INTO accounts (uid, name, type, opening_balance, updated_at) VALUES ('a2', 'TFSA', 'INVESTMENT', 500000, 1);
+             INSERT INTO transactions (uid, type, amount, date, account_id, to_account_id, created_at, updated_at)
+                 VALUES ('t1', 'TRANSFER', 5000, '2026-10-03', 1, 2, 1, 1);
+             INSERT INTO account_values (uid, account_id, date, value, updated_at) VALUES ('v1', 2, '2026-10-01', 600000, 1);",
+        )
+        .unwrap();
+        let mut l = Ledger::init(conn).unwrap();
+        assert_eq!(4i64, l.conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap());
+        let accounts = l.accounts().unwrap();
+        let tfsa = accounts.iter().find(|a| a.name == "TFSA").unwrap();
+        assert_eq!((tfsa.balance, tfsa.registration, tfsa.institution.as_str()), (6_050_00, None, ""));
+        assert_eq!(accounts.iter().find(|a| a.name == "Chequing").unwrap().balance, 950_00);
+        let p = l.portfolio(date(2026, 10, 9)).unwrap();
+        assert_eq!((p.empty, p.accounts.len(), p.value), (false, 1, 0));
+        // The new tables number their rows for sync like the old ones.
+        let before = l.cursor().unwrap();
+        l.room_set(Registration::Tfsa, 2026, 7_000_00).unwrap();
+        assert!(l.cursor().unwrap() > before);
+        let out = l.sync("Pixel", false, before, None, &[], "t").unwrap();
+        assert!(out.changes.iter().any(|c| c.table == "room_facts" && c.uid == "room:TFSA:2026"));
+    }
+
+    #[test]
     fn a_ledger_file_reopens_with_its_entries() {
         let dir = std::env::temp_dir().join(format!("relay-money-{}", new_uid()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("money.db");
         {
             let mut l = Ledger::open(&path).unwrap();
-            let a = l.account_add("Cash", AccountType::Cash, 0).unwrap().id;
+            let a = l.account_add("Cash", AccountType::Cash, 0, None, "").unwrap().id;
             let c = category(&l, "Dining");
             spend(&mut l, a, c, 4_00, "2026-10-02");
         }

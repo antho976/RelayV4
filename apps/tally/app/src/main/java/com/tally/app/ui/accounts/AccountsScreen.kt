@@ -38,6 +38,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tally.app.ui.common.AccountBadge
 import com.tally.app.ui.common.ChromeButton
 import com.tally.app.ui.common.GUTTER
+import com.tally.app.ui.common.HeroNumber
 import com.tally.app.ui.common.HeroAction
 import com.tally.app.ui.common.HeroPanel
 import com.tally.app.ui.common.LegendDot
@@ -50,10 +51,12 @@ import com.tally.app.ui.common.SecondaryAction
 import com.tally.app.ui.common.StackedBar
 import com.tally.app.ui.common.StatChip
 import com.tally.app.ui.common.StatTile
+import com.tally.app.ui.common.TextAction
 import com.tally.app.ui.common.ThinBar
 import com.tally.app.ui.common.TopBar
 import com.tally.app.ui.common.bounceClick
 import com.tally.app.ui.nav.AppNav
+import com.tally.core.AccountType
 import com.tally.core.Copy
 import com.tally.core.TxType
 
@@ -67,6 +70,7 @@ fun AccountsRoute(nav: AppNav) {
             add = { nav.accountEdit(0) },
             open = { nav.transactions(accountId = it) },
             transfer = { nav.entry(type = TxType.TRANSFER) },
+            investments = nav::investments,
         )
     }
     AccountsScreen(state, actions)
@@ -79,6 +83,8 @@ data class AccountsActions(
     /** Opens an account's entries. */
     val open: (Long) -> Unit = {},
     val transfer: () -> Unit = {},
+    /** The portfolio the investment accounts add up to. */
+    val investments: () -> Unit = {},
 )
 
 /**
@@ -228,6 +234,10 @@ private fun ActivePanel(state: AccountsState, actions: AccountsActions, modifier
         } else {
             Spacer(Modifier.height(4.dp))
             state.active.forEach { line -> AccountRow(line, muted = false) { actions.open(line.account.id) } }
+            // An investment account's row opens its entries, the transfers in; what it holds is read on Investments.
+            if (state.active.any { it.account.type == AccountType.INVESTMENT }) {
+                TextAction("investments", actions.investments, Modifier.align(Alignment.End), color = MaterialTheme.colorScheme.primary)
+            }
         }
     }
 }

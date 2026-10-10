@@ -17,7 +17,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -26,15 +25,11 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import com.tally.app.ui.common.Aside
 import com.tally.app.ui.common.FIGURE_GAP
@@ -44,13 +39,10 @@ import com.tally.app.ui.common.ROW_PAD
 import com.tally.app.ui.common.slab
 
 /*
- * Pieces the Accounts and Categories screens share: the lit panel's opening row, its serif
- * figure, a filled text field that sits in a slab group, the zero-state line and a pair of stat
- * tiles. Internal so the categories package can reach them; nothing outside these two uses them.
+ * Pieces the Accounts and Categories screens share: the lit panel's opening row, a filled text
+ * field that sits in a slab group, the zero-state line and a pair of stat tiles. Internal so the
+ * categories package can reach them. The serif figure is common's HeroNumber.
  */
-
-/** The hero figure stops growing here, so a 200% font keeps it on one line. */
-private const val HERO_MAX_SCALE = 1.3f
 
 /**
  * The lit panel's opening row: glyph tile, the mono label, an optional reading at the end. It is
@@ -64,46 +56,6 @@ internal fun HeroHead(
     tint: Color = MaterialTheme.colorScheme.primary,
 ) {
     PanelHeader(label, modifier, meta = end, tint = tint)
-}
-
-/**
- * THE serif figure of a screen. Its font scale is capped and it steps down a size as the text
- * grows, so a long balance at 200% stays on one line instead of breaking mid-number.
- */
-@Composable
-internal fun HeroNumber(
-    text: String,
-    modifier: Modifier = Modifier,
-    color: Color = MaterialTheme.colorScheme.onBackground,
-    description: String? = null,
-    live: Boolean = false,
-) {
-    val density = LocalDensity.current
-    val scale = density.fontScale.coerceAtMost(HERO_MAX_SCALE)
-    val style = heroStyle(text.length, scale)
-    CompositionLocalProvider(LocalDensity provides Density(density.density, scale)) {
-        Text(
-            text,
-            style = style,
-            color = color,
-            modifier = modifier.semantics {
-                if (description != null) contentDescription = description
-                if (live) liveRegion = LiveRegionMode.Polite
-            },
-        )
-    }
-}
-
-@Composable
-private fun heroStyle(length: Int, scale: Float): TextStyle {
-    val type = MaterialTheme.typography
-    val width = length * scale
-    return when {
-        width <= 9.5f -> type.displayLarge
-        width <= 12f -> type.displayMedium
-        width <= 15f -> type.headlineLarge
-        else -> type.headlineMedium
-    }
 }
 
 /**

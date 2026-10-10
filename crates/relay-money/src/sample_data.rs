@@ -125,12 +125,8 @@ pub fn build(today: Date, fraction_digits: u32, currency: &str, seed: i32) -> Ba
     let money = |major: f64| java_round(major * unit);
 
     let account = |id: i64, name: &str, r#type: AccountType, opening_balance: i64, sort_order: i32| AccountDto {
-        id,
-        name: format!("{ACCOUNT_PREFIX} {name}"),
-        r#type,
-        opening_balance,
-        archived: false,
         sort_order,
+        ..AccountDto::new(id, format!("{ACCOUNT_PREFIX} {name}"), r#type, opening_balance)
     };
     let accounts = vec![
         account(1, "chequing", AccountType::Chequing, money(2_400.0), 0),

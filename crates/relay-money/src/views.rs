@@ -1,12 +1,15 @@
 //! What the ledger answers with: the shapes the `money.*` bus ops return. Apart from
 //! [`crate::ledger`] so the bus contract does not pull in SQLite.
 
-use crate::model::{AccountType, CategoryKind, GoalKind, TxType};
+use crate::model::{AccountType, ActivityType, CategoryKind, GoalKind, Registration, TxType};
 use crate::pace::{PaceReading, PaceStatus};
 use crate::period::BudgetPeriod;
 use jiff::civil::Date;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+pub use crate::invest::Portfolio;
+pub use crate::wealthsimple::{Skipped, WsKind};
 
 /// The ledger's own settings, carried in a backup.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -60,6 +63,9 @@ pub struct AccountView {
     pub r#type: AccountType,
     pub balance: i64,
     pub archived: bool,
+    /// An investment account's tax wrapper; `None` on every other account.
+    pub registration: Option<Registration>,
+    pub institution: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -204,6 +210,121 @@ pub struct TxPatch {
     pub to_account_id: Option<i64>,
     pub category_id: Option<i64>,
     pub note: Option<String>,
+}
+
+/// What an account edit changes; absent fields keep their value. A registration is kept only on
+/// an investment account.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneyAccountPatch")]
+pub struct AccountPatch {
+    pub name: Option<String>,
+    pub registration: Option<Registration>,
+    pub institution: Option<String>,
+    pub archived: Option<bool>,
+}
+
+/// One investment activity as a client draws it (docs/INVESTMENTS.md), its account and security
+/// joined in. `quantity` is at 1e-8 of a unit; `amount` and `fee` are minor units of `currency`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneyActivity")]
+pub struct ActivityView {
+    pub id: i64,
+    pub uid: String,
+    pub account_id: i64,
+    pub account: String,
+    pub security_id: Option<i64>,
+    pub symbol: Option<String>,
+    pub name: Option<String>,
+    pub r#type: ActivityType,
+    pub date: String,
+    pub quantity: i64,
+    pub amount: i64,
+    pub fee: i64,
+    pub currency: String,
+    pub to_amount: Option<i64>,
+    pub to_currency: Option<String>,
+    pub note: String,
+    /// `MANUAL` or `WEALTHSIMPLE`.
+    pub source: String,
+}
+
+/// What a new activity carries. `symbol` finds or makes the security `sec:<SYMBOL>`; `currency`
+/// is the ledger's when absent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneyActivityInput")]
+pub struct ActivityInput {
+    pub account_id: i64,
+    pub r#type: ActivityType,
+    pub date: String,
+    pub symbol: Option<String>,
+    pub currency: Option<String>,
+    pub quantity: Option<i64>,
+    pub amount: i64,
+    pub fee: Option<i64>,
+    pub note: Option<String>,
+    pub to_amount: Option<i64>,
+    pub to_currency: Option<String>,
+}
+
+/// Which activities to list, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneyActivityQuery")]
+pub struct ActivityQuery {
+    pub account_id: Option<i64>,
+    pub r#type: Option<ActivityType>,
+    /// `YYYY-MM-DD`: activities on or after it.
+    pub since: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// An account a Wealthsimple file names, and the Tally account already holding its number.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneyImportPreviewAccount")]
+pub struct ImportPreviewAccount {
+    pub number: String,
+    pub name: String,
+    pub registration: Registration,
+    pub account_id: Option<i64>,
+    pub rows: usize,
+}
+
+/// What importing a Wealthsimple file would do, before it does it. `new` and `duplicates` count
+/// its holdings and activities: a duplicate is a line already imported (or imported and deleted).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneyImportPreview")]
+pub struct ImportPreview {
+    pub kind: WsKind,
+    pub as_of: Option<String>,
+    pub accounts: Vec<ImportPreviewAccount>,
+    pub holdings: usize,
+    pub activities: usize,
+    pub new: usize,
+    pub duplicates: usize,
+    pub skipped: Vec<Skipped>,
+}
+
+/// Where one Wealthsimple account goes: `account_id`, or a new account when it has none.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneyImportAccount")]
+pub struct ImportAccount {
+    pub number: String,
+    pub account_id: Option<i64>,
+}
+
+/// What an import wrote. `duplicates` are lines it left out because they were already in (or
+/// deleted); `skipped` lines it could not read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneyImportResult")]
+pub struct ImportResult {
+    pub kind: WsKind,
+    pub accounts_created: usize,
+    pub securities: usize,
+    pub holdings: usize,
+    pub activities: usize,
+    pub duplicates: usize,
+    pub prices: usize,
+    pub values: usize,
+    pub skipped: usize,
 }
 
 /// One row's change on the sync wire (docs/MONEY.md, "Sync"). `row` holds the table's fields in

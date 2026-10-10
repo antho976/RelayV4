@@ -26,10 +26,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import com.tally.app.ui.common.FIGURE_GAP
@@ -41,12 +39,9 @@ import com.tally.app.ui.common.PanelHeader
 import com.tally.app.ui.common.TopBar
 
 /*
- * Pieces the Settings pages and onboarding share: the page head, the hero's label row and figure,
- * the accent-lit row badge, and the currency row.
+ * Pieces the Settings pages and onboarding share: the page head, the hero's label row, the
+ * accent-lit row badge, and the currency row. The serif figure is common's HeroNumber.
  */
-
-/** The hero figure stops growing here, so a 200% font keeps a long amount on one line. */
-private const val FIGURE_MAX_SCALE = 1.3f
 
 /** Titles stop growing here, as Android 14's own non-linear font scale does, so "Appearance" never breaks mid-word. */
 private const val TITLE_MAX_SCALE = 1.5f
@@ -109,41 +104,6 @@ internal fun HeroHead(
     tint: Color = MaterialTheme.colorScheme.primary,
 ) {
     PanelHeader(label, modifier, meta = end, tint = tint)
-}
-
-/**
- * THE serif figure of a page. Its font scale is capped and it steps down a size as the text grows,
- * so "R$1,234.56" at 200% stays on one line instead of breaking mid-number.
- */
-@Composable
-internal fun HeroNumber(
-    text: String,
-    modifier: Modifier = Modifier,
-    color: Color = MaterialTheme.colorScheme.onBackground,
-    description: String? = null,
-) {
-    val density = LocalDensity.current
-    val scale = density.fontScale.coerceAtMost(FIGURE_MAX_SCALE)
-    CompositionLocalProvider(LocalDensity provides Density(density.density, scale)) {
-        Text(
-            text,
-            style = figureStyle(text.length, scale),
-            color = color,
-            modifier = modifier.semantics { if (description != null) contentDescription = description },
-        )
-    }
-}
-
-@Composable
-private fun figureStyle(length: Int, scale: Float): TextStyle {
-    val type = MaterialTheme.typography
-    val width = length * scale
-    return when {
-        width <= 9.5f -> type.displayLarge
-        width <= 12f -> type.displayMedium
-        width <= 15f -> type.headlineLarge
-        else -> type.headlineMedium
-    }
 }
 
 /** A settings row's glyph on an accent wash, so the page reads as one lit family of rows. */

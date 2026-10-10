@@ -1,4 +1,4 @@
-//! The add / edit entry sheet, and the add account sheet.
+//! The add / edit entry sheet, the add account sheet, and the record a value sheet.
 use super::formatter;
 use super::pages::{human_date, today};
 use crate::app::{button, label, rows, text, Ui};
@@ -110,7 +110,7 @@ fn form(ui: &Rc<Ui>, panel: &Rc<Panel>, lists: &Value, tx: Option<Value>) {
     }
     body.append(&segments);
 
-    // The amount, in the serif figure voice, with the currency beside it.
+    // The amount, in the figure voice, with the currency beside it.
     let amount_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     amount_row.add_css_class("money-amount-row");
     let amount = gtk::Entry::new();
@@ -178,26 +178,7 @@ fn form(ui: &Rc<Ui>, panel: &Rc<Panel>, lists: &Value, tx: Option<Value>) {
 
     // The date: today unless changed, picked on a calendar.
     let day = Rc::new(RefCell::new(tx.as_ref().map_or_else(today, |t| text(t, "date").to_string())));
-    let date_key = gtk::MenuButton::new();
-    date_key.add_css_class("money-picker");
-    date_key.set_widget_name("money-entry-date");
-    date_key.set_label(&human_date(&day.borrow()));
-    let calendar = gtk::Calendar::new();
-    if let Some(selected) = parse_day(&day.borrow()) {
-        calendar.set_date(&selected);
-    }
-    let popover = gtk::Popover::new();
-    popover.set_child(Some(&calendar));
-    date_key.set_popover(Some(&popover));
-    {
-        let (day, date_key, popover) = (day.clone(), date_key.clone(), popover.clone());
-        calendar.connect_day_selected(move |calendar| {
-            let picked = calendar.date().format("%Y-%m-%d").map(|s| s.to_string()).unwrap_or_default();
-            date_key.set_label(&human_date(&picked));
-            *day.borrow_mut() = picked;
-            popover.popdown();
-        });
-    }
+    let date_key = day_picker(&day, "money-entry-date");
     field(body, "Date", &date_key);
 
     let note = gtk::Entry::new();
@@ -339,6 +320,29 @@ fn parse_day(value: &str) -> Option<glib::DateTime> {
     glib::DateTime::from_local(y, m, d, 0, 0, 0.0).ok()
 }
 
+/// A key showing `day` ("Today", "Tue 6 Oct") that picks another on a calendar, into `day`.
+fn day_picker(day: &Rc<RefCell<String>>, name: &str) -> gtk::MenuButton {
+    let date_key = gtk::MenuButton::new();
+    date_key.add_css_class("money-picker");
+    date_key.set_widget_name(name);
+    date_key.set_label(&human_date(&day.borrow()));
+    let calendar = gtk::Calendar::new();
+    if let Some(selected) = parse_day(&day.borrow()) {
+        calendar.set_date(&selected);
+    }
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&calendar));
+    date_key.set_popover(Some(&popover));
+    let (day, shown, popover) = (day.clone(), date_key.clone(), popover.clone());
+    calendar.connect_day_selected(move |calendar| {
+        let picked = calendar.date().format("%Y-%m-%d").map(|s| s.to_string()).unwrap_or_default();
+        shown.set_label(&human_date(&picked));
+        *day.borrow_mut() = picked;
+        popover.popdown();
+    });
+    date_key
+}
+
 const ACCOUNT_TYPES: [(&str, &str); 5] = [
     ("CHEQUING", "Chequing"),
     ("SAVINGS", "Savings"),
@@ -349,6 +353,12 @@ const ACCOUNT_TYPES: [(&str, &str); 5] = [
 
 /// The add account sheet: a name, a type and what it holds today.
 pub fn account(ui: &Rc<Ui>) {
+    account_of(ui, None);
+}
+
+/// [`account`] with `kind` (an `AccountType` name) chosen to start with. An investment account
+/// also takes its registration (TFSA, RRSP…) and where it is held.
+pub fn account_of(ui: &Rc<Ui>, kind: Option<&str>) {
     let Some(panel) = Panel::toggle(ui, "Add an account", 460) else { return };
     panel.add_css_class("money-sheet");
     let body = &panel.body;
@@ -359,10 +369,24 @@ pub fn account(ui: &Rc<Ui>) {
     name.set_placeholder_text(Some("Everyday chequing"));
     field(body, "Name", &name);
     let kinds: Vec<&str> = ACCOUNT_TYPES.iter().map(|(_, caption)| *caption).collect();
+    let picked = kind.and_then(|k| ACCOUNT_TYPES.iter().position(|(value, _)| *value == k)).unwrap_or(0);
     let kind = gtk::DropDown::from_strings(&kinds);
     kind.add_css_class("money-picker");
     kind.set_widget_name("money-account-type");
+    kind.set_selected(picked as u32);
     field(body, "Type", &kind);
+    // An investment account's registration and institution; hidden for the other types. A new
+    // one starts non-registered: a wrong TFSA or RRSP would count its money against the room.
+    let registrations: Vec<&str> = super::invest::REGISTRATIONS.iter().map(|(_, caption)| *caption).collect();
+    let registration = gtk::DropDown::from_strings(&registrations);
+    registration.add_css_class("money-picker");
+    registration.set_widget_name("money-account-registration");
+    let registration_block = field(body, "Registration", &registration);
+    let institution = gtk::Entry::new();
+    institution.add_css_class("money-field");
+    institution.set_widget_name("money-account-institution");
+    institution.set_placeholder_text(Some("Wealthsimple"));
+    let institution_block = field(body, "Held at", &institution);
     let balance_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let balance = gtk::Entry::new();
     balance.add_css_class("money-field");
@@ -371,16 +395,38 @@ pub fn account(ui: &Rc<Ui>) {
     balance.set_placeholder_text(Some(&fmt.format_input(0)));
     balance_row.append(&balance);
     balance_row.append(&label(&fmt.currency, "money-suffix"));
-    field(body, "Holds today", &balance_row);
+    let balance_block = field(body, "Holds today", &balance_row);
     let owed = gtk::CheckButton::with_label("This is money owed, such as a card balance");
     owed.set_widget_name("money-account-owed");
+    owed.set_active(ACCOUNT_TYPES[picked].0 == "CREDIT");
     body.append(&owed);
-    let weak_owed = owed.downgrade();
-    kind.connect_selected_notify(move |kind| {
-        if let Some(owed) = weak_owed.upgrade() {
-            owed.set_active(ACCOUNT_TYPES[kind.selected() as usize].0 == "CREDIT");
+    let shape = {
+        let (name, owed, registration_block, institution_block) = (name.downgrade(), owed.downgrade(), registration_block.downgrade(), institution_block.downgrade());
+        let balance_caption = balance_block.first_child().and_downcast::<gtk::Label>();
+        move |index: u32, changed: bool| {
+            let value = ACCOUNT_TYPES.get(index as usize).map_or("", |(value, _)| *value);
+            let investing = value == "INVESTMENT";
+            if let Some(owed) = owed.upgrade() {
+                owed.set_visible(!investing);
+                if changed {
+                    owed.set_active(value == "CREDIT");
+                }
+            }
+            for block in [&registration_block, &institution_block] {
+                if let Some(block) = block.upgrade() {
+                    block.set_visible(investing);
+                }
+            }
+            if let Some(caption) = &balance_caption {
+                caption.set_text(if investing { "WORTH TODAY" } else { "HOLDS TODAY" });
+            }
+            if let Some(name) = name.upgrade() {
+                name.set_placeholder_text(Some(if investing { "Wealthsimple TFSA" } else { "Everyday chequing" }));
+            }
         }
-    });
+    };
+    shape(picked as u32, false);
+    kind.connect_selected_notify(move |kind| shape(kind.selected(), true));
     let problem = label("", "money-problem");
     problem.set_wrap(true);
     problem.set_visible(false);
@@ -393,6 +439,7 @@ pub fn account(ui: &Rc<Ui>) {
         let ui = ui.clone();
         let sheet = Rc::downgrade(&panel);
         let (name, kind, balance, owed, problem, save) = (name.clone(), kind.clone(), balance.clone(), owed.clone(), problem.clone(), save.clone());
+        let (registration, institution) = (registration.clone(), institution.clone());
         move || {
             let title = name.text().trim().to_string();
             if title.is_empty() {
@@ -401,15 +448,34 @@ pub fn account(ui: &Rc<Ui>) {
                 name.grab_focus();
                 return;
             }
-            let typed = balance.text();
-            let opening = if typed.trim().is_empty() { Some(0) } else { formatter().parse(&typed) };
-            let Some(opening) = opening else {
-                problem.set_text("Type what it holds as an amount, like 1250.00. Tick the box below for money owed.");
+            let Some((value, _)) = ACCOUNT_TYPES.get(kind.selected() as usize) else {
+                problem.set_text("Pick the account's type.");
                 problem.set_visible(true);
                 return;
             };
-            let opening = if owed.is_active() { -opening } else { opening };
-            let payload = json!({"name":title,"type":ACCOUNT_TYPES[kind.selected() as usize].0,"opening_balance":opening});
+            let investing = *value == "INVESTMENT";
+            let typed = balance.text();
+            let opening = if typed.trim().is_empty() { Some(0) } else { formatter().parse(&typed) };
+            let Some(opening) = opening else {
+                problem.set_text(if investing {
+                    "Type what it is worth as an amount, like 1250.00."
+                } else {
+                    "Type what it holds as an amount, like 1250.00. Tick the box below for money owed."
+                });
+                problem.set_visible(true);
+                return;
+            };
+            let opening = if owed.is_active() && !investing { -opening } else { opening };
+            let mut payload = json!({"name":title,"type":value,"opening_balance":opening});
+            if investing {
+                if let Some((registered, _)) = super::invest::REGISTRATIONS.get(registration.selected() as usize) {
+                    payload["registration"] = json!(registered);
+                }
+                let held = institution.text().trim().to_string();
+                if !held.is_empty() {
+                    payload["institution"] = json!(held);
+                }
+            }
             save.set_sensitive(false);
             problem.set_visible(false);
             let (ui, sheet, problem, save) = (ui.clone(), sheet.clone(), problem.clone(), save.clone());
@@ -436,7 +502,91 @@ pub fn account(ui: &Rc<Ui>) {
     save.connect_clicked(move |_| run());
     let run = submit.clone();
     name.connect_activate(move |_| run());
+    let run = submit.clone();
+    institution.connect_activate(move |_| run());
     balance.connect_activate(move |_| submit());
     panel.present();
     name.grab_focus();
+}
+
+/// The record a value sheet: what an investment account is worth on a day (`money.value.set`).
+/// Tally reads an investment account as its newest value, plus the transfers after it.
+pub fn value(ui: &Rc<Ui>, account: &Value) {
+    let Some(panel) = Panel::toggle(ui, "Record a value", 460) else { return };
+    panel.add_css_class("money-sheet");
+    let body = &panel.body;
+    let fmt = formatter();
+    let name = text(account, "name").to_string();
+    let about = label(
+        &format!("What {name} is worth on a day, from its statement or app. Tally counts from the newest value, and transfers after it add to it."),
+        "money-muted",
+    );
+    about.set_wrap(true);
+    body.append(&about);
+    let amount_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    amount_row.add_css_class("money-amount-row");
+    let amount = gtk::Entry::new();
+    amount.add_css_class("money-amount-field");
+    amount.set_widget_name("money-value-amount");
+    amount.set_hexpand(true);
+    amount.set_placeholder_text(Some(&fmt.format_input(0)));
+    amount.set_input_purpose(gtk::InputPurpose::Number);
+    amount.update_property(&[gtk::accessible::Property::Label(&format!("What {name} is worth"))]);
+    amount_row.append(&amount);
+    let code = label(&fmt.currency, "money-suffix");
+    code.set_valign(gtk::Align::Center);
+    amount_row.append(&code);
+    field(body, "Worth", &amount_row);
+    let problem = label("", "money-problem");
+    problem.set_wrap(true);
+    problem.set_visible(false);
+    body.append(&problem);
+    let day = Rc::new(RefCell::new(today()));
+    field(body, "Date", &day_picker(&day, "money-value-date"));
+    let save = button("Record value", "primary");
+    save.add_css_class("money-hero-action");
+    save.set_widget_name("money-value-save");
+    body.append(&save);
+    let submit = {
+        let ui = ui.clone();
+        let sheet = Rc::downgrade(&panel);
+        let (amount, problem, save, day) = (amount.clone(), problem.clone(), save.clone(), day.clone());
+        let id = account["id"].clone();
+        move || {
+            let Some(worth) = formatter().parse(&amount.text()) else {
+                problem.set_text("Type what it is worth, like 25072.31.");
+                problem.set_visible(true);
+                amount.add_css_class("error");
+                amount.grab_focus();
+                return;
+            };
+            amount.remove_css_class("error");
+            problem.set_visible(false);
+            save.set_sensitive(false);
+            let payload = json!({"account_id":id,"date":*day.borrow(),"value":worth});
+            let (ui, sheet, problem, save, name) = (ui.clone(), sheet.clone(), problem.clone(), save.clone(), name.clone());
+            glib::spawn_future_local(async move {
+                match ui.call("money.value.set", payload).await {
+                    Ok(_) => {
+                        if let Some(sheet) = sheet.upgrade() {
+                            sheet.close();
+                        }
+                        super::toast(&ui, &format!("Recorded {name} at {}.", formatter().format(worth)), None);
+                        ui.refresh_page();
+                    }
+                    Err(e) => {
+                        problem.set_text(&e.to_string());
+                        problem.set_visible(true);
+                        save.set_sensitive(true);
+                    }
+                }
+            });
+        }
+    };
+    let submit = Rc::new(submit);
+    let run = submit.clone();
+    save.connect_clicked(move |_| run());
+    amount.connect_activate(move |_| submit());
+    panel.present();
+    amount.grab_focus();
 }

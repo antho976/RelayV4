@@ -55,8 +55,17 @@ data class SyncPrefs(
     val lastReceived: Int = 0,
     /** News from the last syncs worth a line of its own (the phone took the PC's ledger). */
     val note: String? = null,
+    /**
+     * The tables this phone could read when it last synced ([SyncStore.LEDGER_VERSION] then).
+     * Below the current one, the next sync asks the PC for everything (`since` 0), so the rows the
+     * PC sent while this phone could not read them arrive.
+     */
+    val ledgerVersion: Int = 0,
 ) {
     val paired: Boolean get() = pc != null
+
+    /** The next sync asks for every row the PC has, not only those since [cursor]. */
+    val catchingUp: Boolean get() = replaced && ledgerVersion < SyncStore.LEDGER_VERSION
 }
 
 /**
@@ -88,6 +97,7 @@ class SyncStore @Inject constructor(@ApplicationContext context: Context) {
         val lastError = stringPreferencesKey("last_error")
         val lastSent = intPreferencesKey("last_sent")
         val lastReceived = intPreferencesKey("last_received")
+        val ledgerVersion = intPreferencesKey("ledger_version")
     }
 
     val prefs: Flow<SyncPrefs> = store.data
@@ -119,6 +129,7 @@ class SyncStore @Inject constructor(@ApplicationContext context: Context) {
                 lastError = p[Keys.lastError],
                 lastSent = p[Keys.lastSent] ?: 0,
                 lastReceived = p[Keys.lastReceived] ?: 0,
+                ledgerVersion = p[Keys.ledgerVersion] ?: 0,
             )
         }
         .distinctUntilChanged()
@@ -142,7 +153,9 @@ class SyncStore @Inject constructor(@ApplicationContext context: Context) {
 
     /**
      * A sync that worked. [note] is news to keep showing; a later sync that moves anything
-     * either way retires it, one that moves nothing leaves it standing.
+     * either way retires it, one that moves nothing leaves it standing. Every sync that works has
+     * caught up with the PC's ledger in every table this build reads (PcSync asks for everything
+     * when [SyncPrefs.catchingUp]), so it records [LEDGER_VERSION].
      */
     suspend fun recordSuccess(at: Long, cursor: Long, generation: String?, watermark: Long, sent: Int, received: Int, note: String? = null) = store.edit {
         if (it[Keys.token] == null) return@edit
@@ -159,6 +172,7 @@ class SyncStore @Inject constructor(@ApplicationContext context: Context) {
         it.remove(Keys.lastError)
         it[Keys.lastSent] = sent
         it[Keys.lastReceived] = received
+        it[Keys.ledgerVersion] = LEDGER_VERSION
     }
 
     suspend fun recordFailure(at: Long, reason: String) = store.edit {
@@ -184,6 +198,15 @@ class SyncStore @Inject constructor(@ApplicationContext context: Context) {
             prefs.lastError?.let { e -> it[Keys.lastError] = e }
             it[Keys.lastSent] = prefs.lastSent
             it[Keys.lastReceived] = prefs.lastReceived
+            it[Keys.ledgerVersion] = prefs.ledgerVersion
         }
+    }
+
+    companion object {
+        /**
+         * The synced tables this build reads: the Room version that last added one (4, the
+         * investments of docs/INVESTMENTS.md). Raise it with the next table.
+         */
+        const val LEDGER_VERSION = 4
     }
 }

@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ShowChart
 import androidx.compose.material.icons.rounded.AccountBalance
 import androidx.compose.material.icons.rounded.Category
 import androidx.compose.material.icons.rounded.Computer
@@ -78,6 +79,7 @@ fun SettingsRoute(nav: AppNav) {
                     SettingsDest.EXPORT -> nav.export()
                     SettingsDest.PC -> nav.pc()
                     SettingsDest.ABOUT -> nav.about()
+                    SettingsDest.INVESTMENTS -> nav.investments()
                     // The two acts that ask first are the screen's; it never routes them here.
                     SettingsDest.SAMPLE, SettingsDest.ERASE -> Unit
                 }
@@ -227,6 +229,7 @@ internal fun destIcon(dest: SettingsDest): ImageVector = when (dest) {
     SettingsDest.SAMPLE -> Icons.Rounded.Science
     SettingsDest.ERASE -> Icons.Rounded.DeleteForever
     SettingsDest.ABOUT -> Icons.Rounded.Info
+    SettingsDest.INVESTMENTS -> Icons.AutoMirrored.Rounded.ShowChart
 }
 
 private fun hitRow(entry: SettingsEntry, onOpen: (SettingsDest) -> Unit): @Composable (Shape) -> Unit = { shape ->

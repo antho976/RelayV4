@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 280,
+  "op_count": 293,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -4716,6 +4716,46 @@
         "$ref": "#/$defs/MoneyAccount"
       }
     },
+    "money.account.update": {
+      "summary": "Rename an account, set its registration or institution, or archive it; absent fields keep their value",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyAccountUpdateIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyAccount"
+      }
+    },
+    "money.value.set": {
+      "summary": "Record what an investment account was worth on a day; a second value the same day replaces the first",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyValueSetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyAccount"
+      }
+    },
     "money.settings.set": {
       "summary": "Change the currency or the day the budget month starts",
       "kind": "mutation",
@@ -4832,6 +4872,220 @@
       },
       "result": {
         "$ref": "#/$defs/MoneySyncOut"
+      }
+    },
+    "money.invest.summary": {
+      "summary": "The investments: value, book, gain and income, each account with its money-weighted return, the allocation, holdings, and the TFSA, RRSP and FHSA room left this year",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyInvestSummaryIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyPortfolio"
+      }
+    },
+    "money.invest.list": {
+      "summary": "Investment activities (buys, sells, dividends, deposits…), newest first",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyInvestListIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyInvestListOut"
+      }
+    },
+    "money.invest.add": {
+      "summary": "Record an investment activity in an investment account: a buy, sell, dividend, deposit, fee…",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyInvestAddIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyActivity"
+      }
+    },
+    "money.invest.delete": {
+      "summary": "Delete an investment activity (kept as a tombstone, so an imported line is never imported again)",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "money.invest.restore": {
+      "summary": "Bring back a deleted investment activity: the Undo of money.invest.delete",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyActivity"
+      }
+    },
+    "money.invest.preview": {
+      "summary": "Read a Wealthsimple file without importing it: its kind, its accounts and the Tally accounts already holding them, and how many lines are new",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyInvestPreviewIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyImportPreview"
+      }
+    },
+    "money.invest.import": {
+      "summary": "Import a Wealthsimple file: holdings, activities, prices and the accounts' values. A line already imported, or imported and deleted, is left out",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyInvestImportIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyImportResult"
+      }
+    },
+    "money.invest.room": {
+      "summary": "Set or remove the CRA contribution room for a registration and year",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyInvestRoomIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "money.invest.price": {
+      "summary": "Record a security's price on a day",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyInvestPriceIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "money.fx.set": {
+      "summary": "Record an exchange rate on a day",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyFxSetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "money.fx.fetch": {
+      "summary": "Fetch the US dollar's recent daily rates in Canadian dollars from the Bank of Canada (no key, nothing personal sent) in the background; money.changed follows",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyFxFetchOut"
       }
     },
     "thread.list": {
@@ -16566,6 +16820,20 @@
         },
         "archived": {
           "type": "boolean"
+        },
+        "registration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Registration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An investment account's tax wrapper; `None` on every other account."
+        },
+        "institution": {
+          "type": "string"
         }
       },
       "required": [
@@ -16573,7 +16841,8 @@
         "name",
         "type",
         "balance",
-        "archived"
+        "archived",
+        "institution"
       ]
     },
     "AccountType": {
@@ -16586,6 +16855,20 @@
         "INVESTMENT"
       ],
       "description": "`Investment` holds money put to work (a TFSA, an RRSP, a brokerage account); its value can be\nupdated by hand."
+    },
+    "Registration": {
+      "type": "string",
+      "enum": [
+        "NON_REGISTERED",
+        "TFSA",
+        "RRSP",
+        "FHSA",
+        "RESP",
+        "LIRA",
+        "RRIF",
+        "OTHER"
+      ],
+      "description": "How the tax rules see an `Investment` account (docs/INVESTMENTS.md). A field of the account,\nnot an account type of its own."
     },
     "MoneyBill": {
       "type": "object",
@@ -17284,11 +17567,93 @@
             "null"
           ],
           "format": "int64"
+        },
+        "registration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Registration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Investment accounts only: TFSA, RRSP, FHSA…"
+        },
+        "institution": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Where the account is held, e.g. Wealthsimple."
         }
       },
       "required": [
         "name",
         "type"
+      ]
+    },
+    "MoneyAccountUpdateIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "registration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Registration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Investment accounts only."
+        },
+        "institution": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "archived": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "MoneyValueSetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "date": {
+          "type": "string"
+        },
+        "value": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "account_id",
+        "date",
+        "value"
       ]
     },
     "MoneySettingsSetIn": {
@@ -17513,6 +17878,1081 @@
         "replaced",
         "applied",
         "skipped"
+      ]
+    },
+    "MoneyInvestSummaryIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "today": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The day to value the portfolio on; today in the engine's time zone when absent."
+        }
+      }
+    },
+    "MoneyPortfolio": {
+      "type": "object",
+      "properties": {
+        "currency": {
+          "type": "string"
+        },
+        "today": {
+          "type": "string"
+        },
+        "empty": {
+          "type": "boolean",
+          "description": "No investment account."
+        },
+        "as_of": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The newest snapshot or price date the reading rests on."
+        },
+        "value": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "book": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "gain": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "gain_bps": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "cash": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "income_12m": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Dividends, interest and reinvested distributions over the 365 days ending today."
+        },
+        "income_by_month": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyIncomeMonth"
+          },
+          "description": "The same by calendar month, the last twelve, oldest first."
+        },
+        "accounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyPortfolioAccount"
+          }
+        },
+        "allocation": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyAllocation"
+          },
+          "description": "By registration, largest first."
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyKindShare"
+          },
+          "description": "By kind of security, cash as `CASH`, largest first."
+        },
+        "holdings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyHolding"
+          },
+          "description": "Largest value first."
+        },
+        "income": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyIncome"
+          },
+          "description": "The newest income, at most 10."
+        },
+        "room": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyRoom"
+          }
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "What the reading could not square, in plain words."
+        }
+      },
+      "required": [
+        "currency",
+        "today",
+        "empty",
+        "value",
+        "book",
+        "gain",
+        "cash",
+        "income_12m",
+        "income_by_month",
+        "accounts",
+        "allocation",
+        "kinds",
+        "holdings",
+        "income",
+        "room",
+        "issues"
+      ],
+      "description": "The portfolio as both devices read it (docs/INVESTMENTS.md, \"The portfolio reading\"). Money is\nin the ledger currency; `*_bps` are basis points. Nothing here is stored or synced: it is read\nagain from the rows each time."
+    },
+    "MoneyIncomeMonth": {
+      "type": "object",
+      "properties": {
+        "month": {
+          "type": "string",
+          "description": "`YYYY-MM`."
+        },
+        "amount": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "month",
+        "amount"
+      ]
+    },
+    "MoneyPortfolioAccount": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        },
+        "registration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Registration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "institution": {
+          "type": "string"
+        },
+        "value": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "book": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "gain": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "gain_bps": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "cash": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "holdings": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "description": "How many positions it holds."
+        },
+        "valued_on": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The newest snapshot or price date its value rests on."
+        },
+        "return_bps": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "The money-weighted return: yearly when `return_annual`, else over the stretch since `return_since`."
+        },
+        "return_annual": {
+          "type": "boolean"
+        },
+        "return_since": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "institution",
+        "value",
+        "book",
+        "gain",
+        "cash",
+        "holdings",
+        "return_annual"
+      ]
+    },
+    "MoneyAllocation": {
+      "type": "object",
+      "properties": {
+        "registration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Registration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "value": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "share_bps": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "value",
+        "share_bps"
+      ]
+    },
+    "MoneyKindShare": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SecurityKind"
+        },
+        "value": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "share_bps": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "kind",
+        "value",
+        "share_bps"
+      ]
+    },
+    "SecurityKind": {
+      "type": "string",
+      "enum": [
+        "STOCK",
+        "ETF",
+        "MUTUAL_FUND",
+        "BOND",
+        "CRYPTO",
+        "CASH",
+        "OTHER"
+      ],
+      "description": "What a security is, for the allocation by kind."
+    },
+    "MoneyHolding": {
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "account": {
+          "type": "string"
+        },
+        "registration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Registration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "security_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SecurityKind"
+        },
+        "currency": {
+          "type": "string",
+          "description": "The security's currency; `price` is in it."
+        },
+        "quantity": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "price": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "price_date": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "book": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "gain": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "gain_bps": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "weight_bps": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "fx_estimated": {
+          "type": "boolean",
+          "description": "Some of its value or book was converted without a rate."
+        },
+        "no_price": {
+          "type": "boolean",
+          "description": "No price on or before today: its value is its book."
+        }
+      },
+      "required": [
+        "account_id",
+        "account",
+        "security_id",
+        "symbol",
+        "name",
+        "kind",
+        "currency",
+        "quantity",
+        "value",
+        "book",
+        "gain",
+        "weight_bps",
+        "fx_estimated",
+        "no_price"
+      ]
+    },
+    "MoneyIncome": {
+      "type": "object",
+      "properties": {
+        "date": {
+          "type": "string"
+        },
+        "account_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/ActivityType"
+        },
+        "amount": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "date",
+        "account_id",
+        "type",
+        "amount"
+      ]
+    },
+    "ActivityType": {
+      "type": "string",
+      "enum": [
+        "DEPOSIT",
+        "TRANSFER_IN",
+        "BUY",
+        "REINVEST",
+        "SPLIT",
+        "DIVIDEND",
+        "INTEREST",
+        "CREDIT",
+        "NOTIONAL_DISTRIBUTION",
+        "RETURN_OF_CAPITAL",
+        "SELL",
+        "TRANSFER_OUT",
+        "FEE",
+        "TAX",
+        "FX",
+        "WITHDRAWAL"
+      ],
+      "description": "What an investment activity did. The order is normative: activities on the same day apply in\nthis order, then by uid, so a buy and a sell on one day never oversell."
+    },
+    "MoneyRoom": {
+      "type": "object",
+      "properties": {
+        "registration": {
+          "$ref": "#/$defs/Registration"
+        },
+        "year": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "room": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "contributed": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "withdrawn": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "left": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "over": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "over_taxed": {
+          "type": "integer",
+          "format": "int64",
+          "description": "What is over past the RRSP's $2,000 buffer; all of `over` for the others."
+        },
+        "deadline": {
+          "type": "string",
+          "description": "The last day that counts for the year."
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "registration",
+        "year",
+        "contributed",
+        "withdrawn",
+        "over",
+        "over_taxed",
+        "deadline"
+      ],
+      "description": "A registration's room in `year`: the CRA figure (`room`, `None` when none was entered) minus\nwhat went in over the window that ends on `deadline`."
+    },
+    "MoneyInvestListIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActivityType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "since": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "`YYYY-MM-DD`: activities on or after it."
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "200 when absent."
+        }
+      }
+    },
+    "MoneyInvestListOut": {
+      "type": "object",
+      "properties": {
+        "activities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyActivity"
+          }
+        }
+      },
+      "required": [
+        "activities"
+      ]
+    },
+    "MoneyActivity": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "uid": {
+          "type": "string"
+        },
+        "account_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "account": {
+          "type": "string"
+        },
+        "security_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/ActivityType"
+        },
+        "date": {
+          "type": "string"
+        },
+        "quantity": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "amount": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "fee": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "currency": {
+          "type": "string"
+        },
+        "to_amount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "to_currency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "note": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "description": "`MANUAL` or `WEALTHSIMPLE`."
+        }
+      },
+      "required": [
+        "id",
+        "uid",
+        "account_id",
+        "account",
+        "type",
+        "date",
+        "quantity",
+        "amount",
+        "fee",
+        "currency",
+        "note",
+        "source"
+      ],
+      "description": "One investment activity as a client draws it (docs/INVESTMENTS.md), its account and security\njoined in. `quantity` is at 1e-8 of a unit; `amount` and `fee` are minor units of `currency`."
+    },
+    "MoneyInvestAddIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "type": {
+          "$ref": "#/$defs/ActivityType"
+        },
+        "date": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The security, e.g. XEQT; it is made when the ledger does not know it yet."
+        },
+        "currency": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The ledger's when absent."
+        },
+        "quantity": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Units at 1e-8: 100000000 is one unit."
+        },
+        "amount": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Minor units of `currency`, never negative: the type says which way the money went."
+        },
+        "fee": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to_amount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "`FX` only: what the money became, in `to_currency`."
+        },
+        "to_currency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "account_id",
+        "type",
+        "date",
+        "amount"
+      ]
+    },
+    "MoneyInvestPreviewIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "An absolute path on the PC: a Wealthsimple holdings report, activities export or monthly statement (CSV)."
+        },
+        "account_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "A statement names no account: the one it would go into, so lines already there count as duplicates."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "MoneyImportPreview": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/MoneyImportKind"
+        },
+        "as_of": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "accounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyImportPreviewAccount"
+          }
+        },
+        "holdings": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "activities": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "new": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "duplicates": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyImportSkipped"
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "accounts",
+        "holdings",
+        "activities",
+        "new",
+        "duplicates",
+        "skipped"
+      ],
+      "description": "What importing a Wealthsimple file would do, before it does it. `new` and `duplicates` count\nits holdings and activities: a duplicate is a line already imported (or imported and deleted)."
+    },
+    "MoneyImportKind": {
+      "type": "string",
+      "enum": [
+        "holdings",
+        "activities",
+        "statement"
+      ],
+      "description": "Which of the three files it was."
+    },
+    "MoneyImportPreviewAccount": {
+      "type": "object",
+      "properties": {
+        "number": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "registration": {
+          "$ref": "#/$defs/Registration"
+        },
+        "account_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "rows": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "number",
+        "name",
+        "registration",
+        "rows"
+      ],
+      "description": "An account a Wealthsimple file names, and the Tally account already holding its number."
+    },
+    "MoneyImportSkipped": {
+      "type": "object",
+      "properties": {
+        "line": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "line",
+        "reason"
+      ],
+      "description": "A line the reader left out, and why. Lines count from 1 at the header."
+    },
+    "MoneyInvestImportIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "An absolute path on the PC."
+        },
+        "accounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyImportAccount"
+          },
+          "description": "Where each of the file's accounts goes, by Wealthsimple's account number: an `account_id`,\nor a new account when it has none. A number not listed goes to the account already holding it."
+        },
+        "account_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "A statement only: the account it belongs to."
+        }
+      },
+      "required": [
+        "path",
+        "accounts"
+      ]
+    },
+    "MoneyImportAccount": {
+      "type": "object",
+      "properties": {
+        "number": {
+          "type": "string"
+        },
+        "account_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "number"
+      ],
+      "description": "Where one Wealthsimple account goes: `account_id`, or a new account when it has none."
+    },
+    "MoneyImportResult": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/MoneyImportKind"
+        },
+        "accounts_created": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "securities": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "holdings": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "activities": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "duplicates": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "prices": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "values": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "kind",
+        "accounts_created",
+        "securities",
+        "holdings",
+        "activities",
+        "duplicates",
+        "prices",
+        "values",
+        "skipped"
+      ],
+      "description": "What an import wrote. `duplicates` are lines it left out because they were already in (or\ndeleted); `skipped` lines it could not read."
+    },
+    "MoneyInvestRoomIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "registration": {
+          "$ref": "#/$defs/Registration",
+          "description": "TFSA, RRSP or FHSA."
+        },
+        "year": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "amount": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The person's figure from CRA My Account (or the Notice of Assessment for an RRSP), minor units. Zero or less removes it."
+        }
+      },
+      "required": [
+        "registration",
+        "year",
+        "amount"
+      ]
+    },
+    "MoneyInvestPriceIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "symbol": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string"
+        },
+        "price": {
+          "type": "integer",
+          "format": "int64",
+          "description": "At 1e-8 of the security's currency's major unit: 3812000000 is 38.12."
+        }
+      },
+      "required": [
+        "symbol",
+        "date",
+        "price"
+      ]
+    },
+    "MoneyFxSetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "type": "string",
+          "description": "ISO 4217 codes: `rate` is units of `quote` for one `base`, at 1e-8."
+        },
+        "quote": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string"
+        },
+        "rate": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "base",
+        "quote",
+        "date",
+        "rate"
+      ]
+    },
+    "MoneyFxFetchOut": {
+      "type": "object",
+      "properties": {
+        "started": {
+          "type": "boolean",
+          "description": "False when a fetch is already on its way."
+        }
+      },
+      "required": [
+        "started"
       ]
     },
     "ThreadListOut": {

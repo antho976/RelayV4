@@ -225,6 +225,46 @@ class PcSyncTest {
         assertEquals(40L, door.syncs.last()["since"]!!.jsonPrimitive.long)
     }
 
+    /**
+     * A phone that synced before it could read the investment tables asks once for everything the
+     * PC has, so the rows the PC numbered meanwhile arrive; from then on it asks from its cursor.
+     */
+    @Test fun anUpdatedPhoneAsksOnceForEverything() = runBlocking<Unit> {
+        db.addAccount("Chequing")
+        door.connection()
+        sync.pair(PairLink.manual(door.address, "ABCD-EFGH")!!)
+        assertEquals(SyncStore.LEDGER_VERSION, store.current().ledgerVersion)
+        // As the build before investments left it.
+        store.restore(store.current().copy(ledgerVersion = 0))
+        assertTrue(store.current().catchingUp)
+        door.answer = { _ ->
+            buildJsonObject {
+                put("cursor", 9)
+                put("generation", "gen-1")
+                put("changes", buildJsonArray {
+                    add(Change("securities", "sec:XEQT", 1_700_000_000_000L, row = buildJsonObject {
+                        put("symbol", "XEQT"); put("name", ""); put("currency", "CAD"); put("kind", "ETF"); put("exchange", "TSX")
+                    }).toJson())
+                })
+                put("replaced", false)
+            }
+        }
+        door.connection()
+
+        sync.syncNow()
+
+        val caughtUp = door.syncs.last()
+        assertEquals("From the start", 0L, caughtUp["since"]!!.jsonPrimitive.long)
+        assertEquals("gen-1", caughtUp["generation"]!!.jsonPrimitive.content)
+        assertFalse(caughtUp["replace"]!!.jsonPrimitive.boolean)
+        assertEquals("XEQT", db.invest().security("sec:XEQT")?.symbol)
+        assertEquals(SyncStore.LEDGER_VERSION, store.current().ledgerVersion)
+
+        door.connection()
+        sync.syncNow()
+        assertEquals("Once", 9L, door.syncs.last()["since"]!!.jsonPrimitive.long)
+    }
+
     @Test fun settingStampsNeverGoBackAndACurrencyWithOtherDecimalsStaysOnThePhone() = runBlocking<Unit> {
         settings.setCurrency("CAD")
         val future = System.currentTimeMillis() + 3_600_000L

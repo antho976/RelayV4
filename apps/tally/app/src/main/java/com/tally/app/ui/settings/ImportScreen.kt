@@ -20,12 +20,15 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.InsertDriveFile
+import androidx.compose.material.icons.automirrored.rounded.ReceiptLong
+import androidx.compose.material.icons.automirrored.rounded.ShowChart
 import androidx.compose.material.icons.rounded.AccountBalance
 import androidx.compose.material.icons.rounded.AddCard
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CopyAll
 import androidx.compose.material.icons.rounded.EditNote
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.SwapHoriz
 import androidx.compose.material.icons.rounded.TableChart
@@ -46,6 +49,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.tally.app.data.db.AccountBalance
 import com.tally.app.ui.accounts.FieldRow
 import com.tally.app.ui.accounts.typeLabel
 import com.tally.app.ui.common.AccountBadge
@@ -55,6 +59,7 @@ import com.tally.app.ui.common.ChoiceRow
 import com.tally.app.ui.common.Dates
 import com.tally.app.ui.common.EndsRow
 import com.tally.app.ui.common.GUTTER
+import com.tally.app.ui.common.HeroNumber
 import com.tally.app.ui.common.GlyphBadge
 import com.tally.app.ui.common.Group
 import com.tally.app.ui.common.GroupBlock
@@ -69,6 +74,18 @@ import com.tally.app.ui.common.RowPill
 import com.tally.app.ui.common.SecondaryAction
 import com.tally.app.ui.common.StatChip
 import com.tally.app.ui.common.TransferBadge
+import com.tally.app.ui.invest.FileAccount
+import com.tally.app.ui.invest.INVEST_FOOTER
+import com.tally.app.ui.invest.InvestImport
+import com.tally.app.ui.invest.KIND_HOLDINGS
+import com.tally.app.ui.invest.KIND_STATEMENT
+import com.tally.app.ui.invest.WS_ACTIVITIES_STEPS
+import com.tally.app.ui.invest.WS_HOLDINGS_STEPS
+import com.tally.app.ui.invest.investActionLabel
+import com.tally.app.ui.invest.investFileLine
+import com.tally.app.ui.invest.investPlanLine
+import com.tally.app.ui.invest.newAccountName
+import com.tally.app.ui.invest.registrationLabel
 import com.tally.app.ui.nav.AppNav
 import com.tally.core.AccountType
 import com.tally.core.Copy
@@ -99,6 +116,10 @@ fun ImportRoute(nav: AppNav) {
             confirm = viewModel::confirm,
             again = viewModel::again,
             history = nav::history,
+            mapAccount = viewModel::mapAccount,
+            setStatementAccount = viewModel::setStatementAccount,
+            investments = nav::investmentsAfterImport,
+            addAccount = { nav.accountEdit(0) },
         ),
     )
 }
@@ -118,6 +139,13 @@ data class ImportActions(
     val confirm: () -> Unit = {},
     val again: () -> Unit = {},
     val history: () -> Unit = {},
+    /** Where an investment file's account (by its number) goes: an account's id, or null for a new one. */
+    val mapAccount: (String, Long?) -> Unit = { _, _ -> },
+    /** The investment account a Wealthsimple monthly statement belongs to. */
+    val setStatementAccount: (Long) -> Unit = {},
+    /** The portfolio, once an investment file is in. */
+    val investments: () -> Unit = {},
+    val addAccount: () -> Unit = {},
 )
 
 private val NEW_TYPES = listOf(AccountType.CHEQUING, AccountType.SAVINGS, AccountType.CREDIT, AccountType.INVESTMENT, AccountType.CASH)
@@ -129,6 +157,8 @@ private const val PREVIEW_LINES = 8
  * Import from your bank. First the banks, each with where its CSV lives; then, with a file read,
  * the preview: how many lines go in under the light, the account they go into, how the file's
  * signs read, what to do with card payments and transfers, and the first lines as they will look.
+ * A Wealthsimple investment file gets its own preview: the holdings or activities it holds, where
+ * each of its accounts goes, and the lines it leaves out.
  */
 @Composable
 fun ImportScreen(state: ImportState, actions: ImportActions) {
@@ -137,9 +167,11 @@ fun ImportScreen(state: ImportState, actions: ImportActions) {
         contentPadding = PaddingValues(bottom = 32.dp),
         verticalArrangement = Arrangement.spacedBy(PANEL_GAP),
     ) {
+        val pending = state.invest
         when (state.stage) {
             ImportStage.CHOOSE, ImportStage.READING -> chooseItems(state, actions)
-            ImportStage.PREVIEW, ImportStage.WRITING -> previewItems(state, actions)
+            ImportStage.PREVIEW, ImportStage.WRITING ->
+                if (pending != null) investItems(state, pending, actions) else previewItems(state, actions)
             ImportStage.DONE -> doneItems(state, actions)
         }
     }
@@ -148,20 +180,32 @@ fun ImportScreen(state: ImportState, actions: ImportActions) {
 private fun androidx.compose.foundation.lazy.LazyListScope.chooseItems(state: ImportState, actions: ImportActions) {
     item(key = "head") {
         PageHead(
-            "Import from your bank",
+            if (state.investFirst) "Import your investments" else "Import from your bank",
             onBack = actions.back,
-            context = if (state.stage == ImportStage.READING) "Reading the file" else "A statement joins your entries; nothing is replaced",
+            context = when {
+                state.stage == ImportStage.READING -> "Reading the file"
+                state.investFirst -> "Wealthsimple's own files, read on this phone"
+                else -> "A statement joins your entries; nothing is replaced"
+            },
         )
+    }
+    // Opened from Investments, Wealthsimple's investment files lead; the problem line sits under the group it came from.
+    if (state.investFirst) {
+        item(key = "investments") { InvestSources(state, actions, showProblem = true) }
     }
     item(key = "banks") {
         val rows = BankSource.entries.map { bank -> bankRow(bank, state.source == bank, enabled = state.stage == ImportStage.CHOOSE, actions.pick) }
+        val problem = state.problem.takeIf { !state.investFirst }
         Group(
             rows = rows,
             modifier = Modifier.padding(horizontal = GUTTER).padding(top = 14.dp),
             title = "Your bank",
-            footer = state.problem ?: "Neither bank lets an app sign in for you offline, so the bridge is the CSV you download.",
-            footerIsError = state.problem != null,
+            footer = problem ?: "Neither bank lets an app sign in for you offline, so the bridge is the CSV you download.",
+            footerIsError = problem != null,
         )
+    }
+    if (!state.investFirst) {
+        item(key = "investments") { InvestSources(state, actions, showProblem = false) }
     }
     item(key = "tally") {
         val tally: @Composable (Shape) -> Unit = { shape ->
@@ -190,6 +234,45 @@ private fun androidx.compose.foundation.lazy.LazyListScope.chooseItems(state: Im
             footer = "The file is read on this phone and not kept. Lines already in the account are found and left out.",
         )
     }
+}
+
+/**
+ * Wealthsimple's investment files, each with where it lives. Either row opens the file picker: the
+ * import knows a holdings report from an activities export, or from a bank statement, by its columns.
+ */
+@Composable
+private fun InvestSources(state: ImportState, actions: ImportActions, showProblem: Boolean) {
+    val enabled = state.stage == ImportStage.CHOOSE
+    val holdings: @Composable (Shape) -> Unit = { shape ->
+        GroupRow(
+            "Wealthsimple holdings report",
+            shape,
+            subtitle = WS_HOLDINGS_STEPS,
+            leading = { GlyphBadge(Icons.AutoMirrored.Rounded.ShowChart) },
+            trailing = { RowPill("Choose file") },
+            chevron = false,
+            onClick = if (enabled) ({ actions.pick(null) }) else null,
+        )
+    }
+    val activities: @Composable (Shape) -> Unit = { shape ->
+        GroupRow(
+            "Wealthsimple activities export",
+            shape,
+            subtitle = WS_ACTIVITIES_STEPS,
+            leading = { GlyphBadge(Icons.AutoMirrored.Rounded.ReceiptLong) },
+            trailing = { RowPill("Choose file") },
+            chevron = false,
+            onClick = if (enabled) ({ actions.pick(null) }) else null,
+        )
+    }
+    val problem = state.problem.takeIf { showProblem }
+    Group(
+        rows = listOf(holdings, activities),
+        modifier = Modifier.padding(horizontal = GUTTER).padding(top = 14.dp),
+        title = "Your investments",
+        footer = problem ?: INVEST_FOOTER,
+        footerIsError = problem != null,
+    )
 }
 
 private fun bankRow(bank: BankSource, picked: Boolean, enabled: Boolean, onPick: (BankSource?) -> Unit): @Composable (Shape) -> Unit = { shape ->
@@ -460,8 +543,145 @@ private fun androidx.compose.foundation.lazy.LazyListScope.doneItems(state: Impo
     item(key = "head") { PageHead("Imported", onBack = actions.back, context = state.done ?: "Done") }
     item(key = "acts") {
         Column(Modifier.padding(horizontal = GUTTER).padding(top = 14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            HeroAction("See them in History", actions.history, Modifier.fillMaxWidth())
+            if (state.invest != null) {
+                HeroAction("See your portfolio", actions.investments, Modifier.fillMaxWidth())
+            } else {
+                HeroAction("See them in History", actions.history, Modifier.fillMaxWidth())
+            }
             SecondaryAction("Import another file", actions.again, Modifier.fillMaxWidth())
+        }
+    }
+}
+
+// ── A Wealthsimple investment file ───────────────────────────────────────────
+
+private fun androidx.compose.foundation.lazy.LazyListScope.investItems(state: ImportState, pending: InvestImport, actions: ImportActions) {
+    val p = pending.preview
+    val held = state.accounts.filter { it.type == AccountType.INVESTMENT }
+    item(key = "head") { PageHead("Import", onBack = actions.back, context = investFileLine(p) { Dates.short(it, state.today) }) }
+    item(key = "invest-hero") { InvestPlanHero(pending, held, Modifier.padding(horizontal = GUTTER)) }
+    if (p.kind == KIND_STATEMENT) {
+        item(key = "invest-into") { StatementIntoGroup(state, pending, held, actions) }
+    } else {
+        p.accounts.forEach { f -> item(key = "map-" + f.number) { MapGroup(state, f, pending, held, actions) } }
+    }
+    if (p.skipped.isNotEmpty()) {
+        item(key = "skipped") { SkippedPanel(p.skipped, Modifier.padding(horizontal = GUTTER)) }
+    }
+    item(key = "acts") {
+        Column(Modifier.padding(horizontal = GUTTER), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            val problem = state.problem
+            if (problem != null) {
+                Text(problem, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            }
+            HeroAction(
+                if (state.stage == ImportStage.WRITING) "Importing" else investActionLabel(p),
+                actions.confirm,
+                Modifier.fillMaxWidth(),
+                enabled = state.stage == ImportStage.PREVIEW && pending.ready && p.count > 0,
+            )
+            SecondaryAction("Choose another file", actions.again, Modifier.fillMaxWidth(), enabled = state.stage == ImportStage.PREVIEW)
+        }
+    }
+}
+
+/** What the file adds, under the light, and chips for what becomes of the rest. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun InvestPlanHero(pending: InvestImport, held: List<AccountBalance>, modifier: Modifier = Modifier) {
+    val p = pending.preview
+    val into = held.firstOrNull { it.id == pending.statementAccountId }?.name
+    val created = p.accounts.count { pending.mapping[it.number] == null }
+    HeroPanel(modifier) {
+        HeroHead("Ready to import", end = "WEALTHSIMPLE")
+        Spacer(Modifier.height(12.dp))
+        HeroNumber(p.count.toString(), description = investActionLabel(p))
+        Text(investPlanLine(p, into), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(16.dp))
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (created > 0) StatChip(Icons.Rounded.AddCard, Copy.plural(created, "new account") + " to add")
+            if (p.duplicates > 0) StatChip(Icons.Rounded.CopyAll, "${p.duplicates} already in Tally")
+            if (p.skipped.isNotEmpty()) StatChip(Icons.Rounded.EditNote, Copy.plural(p.skipped.size, "line") + " left out")
+            if (p.kind == KIND_HOLDINGS) StatChip(Icons.Rounded.History, "The newest report replaces the one before")
+            StatChip(Icons.Rounded.SwapHoriz, "Never spending or income")
+        }
+    }
+}
+
+/** Where one of the file's accounts goes: an investment account already here, or a new one named for it. */
+@Composable
+private fun MapGroup(state: ImportState, f: FileAccount, pending: InvestImport, held: List<AccountBalance>, actions: ImportActions) {
+    val money = LocalMoney.current
+    val picked = pending.mapping[f.number]
+    val rows: List<@Composable (Shape) -> Unit> = held.map { a ->
+        val valued = a.valuedOn?.let { " · valued " + Dates.short(it, state.today) }.orEmpty()
+        accountRow(a.name, money.format(a.balance) + valued, a.id == picked, { AccountBadge(a.type) }) { actions.mapAccount(f.number, a.id) }
+    } + accountRow(
+        "A new account",
+        "Named " + newAccountName(f),
+        picked == null,
+        { GlyphBadge(Icons.Rounded.AddCard) },
+    ) { actions.mapAccount(f.number, null) }
+    Column(Modifier.padding(horizontal = GUTTER).padding(top = 14.dp).selectableGroup()) {
+        Group(
+            rows = rows,
+            title = f.name.trim().ifEmpty { registrationLabel(f.registration) },
+            trailing = Copy.plural(f.rows, "line"),
+        )
+    }
+}
+
+/** A monthly statement names no account: the investment account it belongs to, or the way to add it. */
+@Composable
+private fun StatementIntoGroup(state: ImportState, pending: InvestImport, held: List<AccountBalance>, actions: ImportActions) {
+    val money = LocalMoney.current
+    val add: @Composable (Shape) -> Unit = { shape ->
+        GroupRow(
+            "Add an investment account",
+            shape,
+            subtitle = if (held.isEmpty()) {
+                "A statement does not name its account: add the one it belongs to, and it shows here"
+            } else {
+                "When it belongs to none of these, add it and it shows here"
+            },
+            leading = { GlyphBadge(Icons.Rounded.AddCard) },
+            onClick = actions.addAccount,
+        )
+    }
+    // The add row stays under the accounts: a TFSA's statement must not have to go into the RRSP.
+    val rows: List<@Composable (Shape) -> Unit> = held.map { a ->
+        val valued = a.valuedOn?.let { " · valued " + Dates.short(it, state.today) }.orEmpty()
+        accountRow(a.name, money.format(a.balance) + valued, a.id == pending.statementAccountId, { AccountBadge(a.type) }) {
+            actions.setStatementAccount(a.id)
+        }
+    } + add
+    Column(Modifier.padding(horizontal = GUTTER).padding(top = 14.dp).selectableGroup()) {
+        Group(
+            rows = rows,
+            title = "Into",
+            footer = if (held.isNotEmpty() && pending.statementAccountId == null) "A statement does not name its account: pick the one it belongs to" else null,
+        )
+    }
+}
+
+/** The lines the file holds that Tally does not read yet, each with why. */
+@Composable
+private fun SkippedPanel(lines: List<String>, modifier: Modifier = Modifier) {
+    Panel(modifier.padding(top = 14.dp)) {
+        PanelHeader("Left out", meta = Copy.plural(lines.size, "line").uppercase())
+        Spacer(Modifier.height(4.dp))
+        lines.take(PREVIEW_LINES).forEach { line ->
+            Text(
+                line,
+                modifier = Modifier.padding(vertical = 6.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        val more = lines.size - PREVIEW_LINES
+        if (more > 0) {
+            Spacer(Modifier.height(6.dp))
+            Text("and $more more", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }

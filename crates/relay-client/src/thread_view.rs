@@ -228,6 +228,9 @@ pub fn tool_caption(name: &str) -> String {
         "money.tx.add" => "Added an entry".into(),
         "money.tx.update" => "Changed an entry".into(),
         "money.tx.restore" => "Restored an entry".into(),
+        "money.invest.summary" => "Read your investments".into(),
+        "money.invest.list" => "Listed investment activity".into(),
+        "money.invest.add" => "Recorded an investment activity".into(),
         "bus.schema" => "Checked how a tool works".into(),
         "" => format!("Used {name}"),
         other => format!("Used {other}"),
@@ -236,7 +239,29 @@ pub fn tool_caption(name: &str) -> String {
 
 /// Whether a tool call changed the ledger, so its card offers Undo.
 pub fn tool_writes(name: &str) -> bool {
-    matches!(tool_op(name).as_deref(), Some("money.tx.add" | "money.tx.update" | "money.tx.restore"))
+    matches!(tool_op(name).as_deref(), Some("money.tx.add" | "money.tx.update" | "money.tx.restore" | "money.invest.add"))
+}
+
+/// An ```` ```import ```` block: the agent asking for a file (docs/INVESTMENTS.md, "The thread agent").
+/// The card it draws lets the person choose the file, previews it and imports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSpec {
+    /// Where the file comes from: only `wealthsimple` today.
+    pub source: String,
+    /// `holdings`, `activities` or `statement`.
+    pub expects: String,
+    pub title: String,
+}
+
+/// Read an import block. `None` when it is not one Relay can act on, so it shows as code instead.
+pub fn import_spec(text: &str) -> Option<ImportSpec> {
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let source = v["source"].as_str()?.trim().to_ascii_lowercase();
+    let expects = v["expects"].as_str()?.trim().to_ascii_lowercase();
+    if source != "wealthsimple" || !matches!(expects.as_str(), "holdings" | "activities" | "statement") {
+        return None;
+    }
+    Some(ImportSpec { source, expects, title: v["title"].as_str().unwrap_or("").trim().to_string() })
 }
 
 /// How a chart is drawn.
@@ -351,5 +376,26 @@ mod tests {
         assert!(tool_writes("mcp__relay__money_tx_update"));
         assert!(!tool_writes("mcp__relay__money_tx_list"));
         assert_eq!(tool_caption("WebSearch"), "Used WebSearch");
+        assert_eq!(tool_op("mcp__relay__money_invest_summary").as_deref(), Some("money.invest.summary"));
+        assert_eq!(tool_caption("mcp__relay__money_invest_summary"), "Read your investments");
+        assert_eq!(tool_caption("mcp__relay__money_invest_list"), "Listed investment activity");
+        assert_eq!(tool_caption("mcp__relay__money_invest_add"), "Recorded an investment activity");
+        assert!(tool_writes("mcp__relay__money_invest_add"));
+        assert!(!tool_writes("mcp__relay__money_invest_summary") && !tool_writes("mcp__relay__money_invest_list"));
+    }
+
+    #[test]
+    fn import_blocks_ask_for_a_wealthsimple_file() {
+        let reply = "Download it, then choose it here:\n\n```import\n{\"source\": \"wealthsimple\", \"expects\": \"holdings\", \"title\": \"Your holdings report\"}\n```";
+        let Block::Code { lang, text } = &markdown(reply)[1] else { panic!("a code block") };
+        assert_eq!(lang, "import");
+        let spec = import_spec(text).unwrap();
+        assert_eq!(spec, ImportSpec { source: "wealthsimple".into(), expects: "holdings".into(), title: "Your holdings report".into() });
+        let untitled = import_spec(r#"{"source": "Wealthsimple", "expects": "Activities"}"#).unwrap();
+        assert_eq!((untitled.expects.as_str(), untitled.title.as_str()), ("activities", ""));
+        assert!(import_spec(r#"{"source": "questrade", "expects": "holdings"}"#).is_none(), "only Wealthsimple is read");
+        assert!(import_spec(r#"{"source": "wealthsimple", "expects": "passwords"}"#).is_none());
+        assert!(import_spec(r#"{"source": "wealthsimple"}"#).is_none());
+        assert!(import_spec("not json").is_none());
     }
 }

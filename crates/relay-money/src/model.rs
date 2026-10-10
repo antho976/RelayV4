@@ -47,6 +47,73 @@ pub enum GoalKind {
     Save,
 }
 
+/// How the tax rules see an `Investment` account (docs/INVESTMENTS.md). A field of the account,
+/// not an account type of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Registration {
+    NonRegistered,
+    Tfsa,
+    Rrsp,
+    Fhsa,
+    Resp,
+    Lira,
+    Rrif,
+    Other,
+}
+
+impl Registration {
+    /// The name a person knows it by; an account an import creates is "Wealthsimple " + this.
+    pub fn label(self) -> &'static str {
+        match self {
+            Registration::NonRegistered => "Non-registered",
+            Registration::Tfsa => "TFSA",
+            Registration::Rrsp => "RRSP",
+            Registration::Fhsa => "FHSA",
+            Registration::Resp => "RESP",
+            Registration::Lira => "LIRA",
+            Registration::Rrif => "RRIF",
+            Registration::Other => "Other",
+        }
+    }
+}
+
+/// What a security is, for the allocation by kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SecurityKind {
+    Stock,
+    Etf,
+    MutualFund,
+    Bond,
+    Crypto,
+    Cash,
+    Other,
+}
+
+/// What an investment activity did. The order is normative: activities on the same day apply in
+/// this order, then by uid, so a buy and a sell on one day never oversell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActivityType {
+    Deposit,
+    TransferIn,
+    Buy,
+    Reinvest,
+    Split,
+    Dividend,
+    Interest,
+    Credit,
+    NotionalDistribution,
+    ReturnOfCapital,
+    Sell,
+    TransferOut,
+    Fee,
+    Tax,
+    Fx,
+    Withdrawal,
+}
+
 /// A category seeded on first run. `icon` is a key the UI maps to a drawn glyph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CategorySeed {
@@ -109,6 +176,20 @@ mod tests {
         assert_eq!(serde_json::to_string(&TxType::Transfer).unwrap(), "\"TRANSFER\"");
         assert_eq!(serde_json::to_string(&AccountType::Chequing).unwrap(), "\"CHEQUING\"");
         assert_eq!(serde_json::from_str::<GoalKind>("\"SAVE\"").unwrap(), GoalKind::Save);
+        assert_eq!(serde_json::to_string(&Registration::NonRegistered).unwrap(), "\"NON_REGISTERED\"");
+        assert_eq!(serde_json::to_string(&SecurityKind::MutualFund).unwrap(), "\"MUTUAL_FUND\"");
+        assert_eq!(serde_json::to_string(&ActivityType::NotionalDistribution).unwrap(), "\"NOTIONAL_DISTRIBUTION\"");
+        assert_eq!(serde_json::to_string(&ActivityType::Fx).unwrap(), "\"FX\"");
+    }
+
+    #[test]
+    fn activities_on_one_day_apply_in_the_contracts_order() {
+        use ActivityType::*;
+        let order = [
+            Deposit, TransferIn, Buy, Reinvest, Split, Dividend, Interest, Credit, NotionalDistribution, ReturnOfCapital, Sell,
+            TransferOut, Fee, Tax, Fx, Withdrawal,
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

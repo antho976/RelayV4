@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{call_as, code, engine, ok};
+use common::{call_as, code, engine, ok, wait_until};
 use relay_bus::Actor;
 use serde_json::json;
 
@@ -128,4 +128,211 @@ fn a_chart_asks_its_question_and_reads_the_ledger_now() {
     assert!(where_it_went["label_colors"][0].is_i64());
     assert_eq!(code(call_as(&engine, Actor::User, "money.series", json!({"category": "Yachts"}))), "money.invalid");
     assert_eq!(code(call_as(&engine, Actor::User, "money.series", json!({"by": "fortnight"}))), "bus.schema");
+}
+
+/// Wealthsimple's holdings report, as the shared tests have it (docs/INVESTMENTS.md, W1): a TFSA
+/// holding Apple in US dollars, XEQT and ARKK, as of 2026-05-08.
+const HOLDINGS_REPORT: &str = "Account Name,Account Type,Account Classification,Account Number,Symbol,Exchange,MIC,Name,Security Type,Quantity,Position Direction,Market Price,Market Price Currency,Book Value (CAD),Book Value Currency (CAD),Book Value (Market),Book Value Currency (Market),Market Value,Market Value Currency,Market Unrealized Returns,Market Unrealized Returns Currency
+\"Demo TFSA\",\"TFSA\",\"Trade\",\"DEMO0001CAD\",\"AAPL\",\"NASDAQ\",\"XNAS\",\"Apple Inc\",\"EQUITY\",\"10\",\"LONG\",\"100\",\"USD\",\"1000\",\"CAD\",\"750\",\"USD\",\"1000\",\"USD\",\"0\",\"USD\"
+\"Demo TFSA\",\"TFSA\",\"Trade\",\"DEMO0001CAD\",\"XEQT\",\"TSX\",\"XTSE\",\"iShares Core Equity ETF Portfolio\",\"EXCHANGE_TRADED_FUND\",\"10\",\"LONG\",\"25\",\"CAD\",\"250\",\"CAD\",\"250\",\"CAD\",\"250\",\"CAD\",\"0\",\"CAD\"
+\"Demo TFSA\",\"TFSA\",\"Trade\",\"DEMO0001CAD\",\"ARKK\",\"BATS\",\"BATS\",\"ARK Innovation ETF\",\"EXCHANGE_TRADED_FUND\",\"1\",\"LONG\",\"50\",\"USD\",\"50\",\"CAD\",\"50\",\"USD\",\"50\",\"USD\",\"0\",\"USD\"
+
+\"As of 2026-05-08 12:00 GMT-04:00\"
+";
+
+/// One unit, at the 1e-8 the ledger keeps units in.
+const UNIT: i64 = 100_000_000;
+
+fn holdings_report(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("holdings-report-2026-05-08.csv");
+    std::fs::write(&path, HOLDINGS_REPORT).unwrap();
+    path
+}
+
+#[test]
+fn a_wealthsimple_holdings_report_is_previewed_imported_once_and_read() {
+    let engine = engine();
+    let dir = tempfile::tempdir().unwrap();
+    let path = holdings_report(dir.path());
+
+    let preview = ok(&engine, "money.invest.preview", json!({"path": path}));
+    assert_eq!((preview["kind"].as_str(), preview["as_of"].as_str()), (Some("holdings"), Some("2026-05-08")));
+    assert_eq!((preview["holdings"].as_u64(), preview["new"].as_u64(), preview["duplicates"].as_u64()), (Some(3), Some(3), Some(0)));
+    let account = &preview["accounts"][0];
+    assert_eq!((account["number"].as_str(), account["name"].as_str(), account["registration"].as_str()), (Some("DEMO0001CAD"), Some("Demo TFSA"), Some("TFSA")));
+    assert!(account["account_id"].is_null(), "no Tally account holds it yet");
+
+    let done = ok(&engine, "money.invest.import", json!({"path": path, "accounts": []}));
+    assert_eq!(done["kind"], "holdings");
+    let counts: Vec<u64> = ["accounts_created", "securities", "holdings", "duplicates", "prices", "values"].iter().map(|k| done[*k].as_u64().unwrap()).collect();
+    assert_eq!(counts, [1, 3, 3, 0, 3, 1]);
+
+    // The summary reads what came in; the account's recorded value is its balance on Home.
+    let portfolio = ok(&engine, "money.invest.summary", json!({"today": "2026-05-08"}));
+    assert_eq!((portfolio["empty"].as_bool(), portfolio["as_of"].as_str(), portfolio["value"].as_i64()), (Some(false), Some("2026-05-08"), Some(163_333)));
+    let held: Vec<(&str, i64, i64)> = portfolio["holdings"].as_array().unwrap().iter()
+        .map(|h| (h["symbol"].as_str().unwrap(), h["quantity"].as_i64().unwrap(), h["book"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(held, [("AAPL", 10 * UNIT, 100_000), ("XEQT", 10 * UNIT, 25_000), ("ARKK", UNIT, 5_000)]);
+    assert_eq!(portfolio["holdings"][0]["fx_estimated"], true, "no USD rate yet: valued by its own book");
+    assert_eq!((portfolio["accounts"][0]["registration"].as_str(), portfolio["accounts"][0]["institution"].as_str()), (Some("TFSA"), Some("Wealthsimple")));
+    let lists = ok(&engine, "money.lists", json!({}));
+    assert_eq!((lists["accounts"][0]["balance"].as_i64(), lists["accounts"][0]["registration"].as_str()), (Some(163_333), Some("TFSA")));
+
+    // The same file again adds nothing, and its preview says so.
+    let again = ok(&engine, "money.invest.import", json!({"path": path, "accounts": []}));
+    assert_eq!((again["accounts_created"].as_u64(), again["holdings"].as_u64(), again["duplicates"].as_u64()), (Some(0), Some(0), Some(3)));
+    let preview = ok(&engine, "money.invest.preview", json!({"path": path}));
+    assert_eq!((preview["new"].as_u64(), preview["duplicates"].as_u64()), (Some(0), Some(3)));
+    assert_eq!(preview["accounts"][0]["account_id"], lists["accounts"][0]["id"]);
+    assert_eq!(ok(&engine, "money.invest.summary", json!({"today": "2026-05-08"}))["value"], 163_333);
+
+    // A file is named by its full path, and must be a Wealthsimple investment file.
+    assert_eq!(code(call_as(&engine, Actor::User, "money.invest.preview", json!({"path": "holdings.csv"}))), "money.path");
+    let cash = dir.path().join("chequing.csv");
+    std::fs::write(&cash, "date,transaction,description,amount,balance,currency\n2026-01-02,SPEND,Metro,-42.18,957.82,CAD\n").unwrap();
+    assert_eq!(code(call_as(&engine, Actor::User, "money.invest.import", json!({"path": cash, "accounts": []}))), "money.invalid");
+}
+
+#[test]
+fn a_wealthsimple_file_is_read_as_the_phone_reads_it_and_only_a_file() {
+    let engine = engine();
+    let dir = tempfile::tempdir().unwrap();
+    // Re-saved by a spreadsheet in Windows-1252, as the phone also reads it: "Non enregistré".
+    let path = dir.path().join("holdings-1252.csv");
+    let text = HOLDINGS_REPORT.replace("\"Demo TFSA\",\"TFSA\"", "\"Demo\",\"Non enregistr\u{e9}\"");
+    let bytes: Vec<u8> = text.chars().map(|c| u8::try_from(u32::from(c)).unwrap()).collect();
+    std::fs::write(&path, bytes).unwrap();
+    let preview = ok(&engine, "money.invest.preview", json!({"path": path}));
+    assert_eq!(preview["accounts"][0]["registration"], "NON_REGISTERED");
+
+    let not_a_file = call_as(&engine, Actor::User, "money.invest.preview", json!({"path": dir.path()}));
+    assert_eq!(code(not_a_file), "money.path");
+    let big = dir.path().join("big.csv");
+    std::fs::File::create(&big).unwrap().set_len((16 << 20) + 1).unwrap();
+    assert_eq!(code(call_as(&engine, Actor::User, "money.invest.import", json!({"path": big, "accounts": []}))), "money.import");
+    assert_eq!(ok(&engine, "money.invest.summary", json!({}))["empty"], true, "nothing came in");
+}
+
+#[test]
+fn an_investment_activity_is_recorded_undone_and_restored() {
+    let engine = engine();
+    let tfsa = ok(&engine, "money.account.add", json!({"name": "TFSA", "type": "INVESTMENT", "registration": "TFSA", "institution": "Wealthsimple"}));
+    assert_eq!((tfsa["registration"].as_str(), tfsa["institution"].as_str()), (Some("TFSA"), Some("Wealthsimple")));
+    let refused = call_as(&engine, Actor::User, "money.account.add", json!({"name": "Chequing", "type": "CHEQUING", "registration": "TFSA"}));
+    assert_eq!(code(refused), "money.invalid");
+
+    // The thread's agent may record one; the card it draws undoes it with money.invest.delete.
+    let deposit = ok(&engine, "money.invest.add", json!({"account_id": tfsa["id"], "type": "DEPOSIT", "date": "2026-08-01", "amount": 50_000}));
+    let buy = call_as(&engine, Actor::agent("brisk-otter"), "money.invest.add", json!({
+        "account_id": tfsa["id"], "type": "BUY", "date": "2026-08-08", "symbol": "xeqt", "quantity": 10 * UNIT, "amount": 38_120, "note": "Monthly"
+    }));
+    let buy = buy.into_result().unwrap();
+    assert_eq!((buy["symbol"].as_str(), buy["account"].as_str(), buy["currency"].as_str(), buy["source"].as_str()), (Some("XEQT"), Some("TFSA"), Some("CAD"), Some("MANUAL")));
+    let listed = ok(&engine, "money.invest.list", json!({}));
+    let ids: Vec<&serde_json::Value> = listed["activities"].as_array().unwrap().iter().map(|a| &a["id"]).collect();
+    assert_eq!(ids, [&buy["id"], &deposit["id"]], "newest first");
+    assert_eq!(ok(&engine, "money.invest.list", json!({"type": "DIVIDEND"}))["activities"], json!([]));
+    assert_eq!(ok(&engine, "money.invest.list", json!({"account_id": tfsa["id"], "since": "2026-08-05"}))["activities"].as_array().unwrap().len(), 1);
+    let refused = call_as(&engine, Actor::User, "money.invest.add", json!({"account_id": tfsa["id"], "type": "SELL", "date": "2026-08-09", "quantity": UNIT, "amount": 3_900}));
+    assert_eq!(code(refused), "money.invalid", "a sale names its security");
+
+    let held = |engine: &relay_core::engine::Engine| ok(engine, "money.invest.summary", json!({"today": "2026-10-09"}))["holdings"].as_array().unwrap().len();
+    assert_eq!(held(&engine), 1);
+    ok(&engine, "money.invest.delete", json!({"id": buy["id"]}));
+    assert_eq!(held(&engine), 0);
+    assert_eq!(code(call_as(&engine, Actor::User, "money.invest.delete", json!({"id": buy["id"]}))), "money.not_found");
+    let back = ok(&engine, "money.invest.restore", json!({"id": buy["id"]}));
+    assert_eq!(back["id"], buy["id"]);
+    assert_eq!(held(&engine), 1);
+
+    // A price, the room and a recorded value move the reading.
+    ok(&engine, "money.invest.price", json!({"symbol": "XEQT", "date": "2026-10-01", "price": 40 * UNIT}));
+    ok(&engine, "money.invest.room", json!({"registration": "TFSA", "year": 2026, "amount": 700_000}));
+    let portfolio = ok(&engine, "money.invest.summary", json!({"today": "2026-10-09"}));
+    let xeqt = &portfolio["holdings"][0];
+    assert_eq!((xeqt["value"].as_i64(), xeqt["book"].as_i64(), xeqt["gain"].as_i64()), (Some(40_000), Some(38_120), Some(1_880)));
+    let room = portfolio["room"].as_array().unwrap().iter().find(|r| r["registration"] == "TFSA").unwrap();
+    assert_eq!((room["room"].as_i64(), room["contributed"].as_i64(), room["left"].as_i64()), (Some(700_000), Some(50_000), Some(650_000)));
+    assert_eq!(code(call_as(&engine, Actor::User, "money.invest.room", json!({"registration": "RESP", "year": 2026, "amount": 1}))), "money.invalid");
+    ok(&engine, "money.fx.set", json!({"base": "usd", "quote": "CAD", "date": "2026-10-01", "rate": 137_000_000}));
+    assert_eq!(code(call_as(&engine, Actor::User, "money.fx.set", json!({"base": "CAD", "quote": "CAD", "date": "2026-10-01", "rate": 1}))), "money.invalid");
+    let valued = ok(&engine, "money.value.set", json!({"account_id": tfsa["id"], "date": "2026-10-09", "value": 52_000}));
+    assert_eq!(valued["balance"], 52_000);
+
+    let renamed = ok(&engine, "money.account.update", json!({"id": tfsa["id"], "name": "Retirement", "registration": "RRSP"}));
+    assert_eq!((renamed["name"].as_str(), renamed["registration"].as_str(), renamed["institution"].as_str()), (Some("Retirement"), Some("RRSP"), Some("Wealthsimple")));
+    let archived = ok(&engine, "money.account.update", json!({"id": tfsa["id"], "archived": true}));
+    assert_eq!(archived["archived"], true);
+    assert_eq!(code(call_as(&engine, Actor::User, "money.account.update", json!({"id": 99, "name": "Nowhere"}))), "money.not_found");
+}
+
+#[test]
+fn files_and_the_network_are_the_persons_alone() {
+    let engine = engine();
+    let dir = tempfile::tempdir().unwrap();
+    let path = holdings_report(dir.path());
+    let agent = Actor::agent("brisk-otter");
+    for (op, payload) in [
+        ("money.invest.preview", json!({"path": path})),
+        ("money.invest.import", json!({"path": path, "accounts": []})),
+        ("money.fx.fetch", json!({})),
+    ] {
+        assert_eq!(code(call_as(&engine, agent.clone(), op, payload)), "actor.allowlist", "{op}");
+    }
+    assert_eq!(ok(&engine, "money.invest.summary", json!({}))["empty"], true, "nothing was imported");
+    // A thread's agent acts as the person, so what keeps it from these is its tool list.
+    for op in ["money.invest.summary", "money.invest.list", "money.invest.add"] {
+        assert!(relay_core::threads::peer_may_call(op), "{op}");
+    }
+    for op in ["money.invest.import", "money.invest.preview", "money.invest.delete", "money.invest.room", "money.fx.fetch", "money.fx.set", "money.value.set"] {
+        assert!(!relay_core::threads::peer_may_call(op), "{op}");
+    }
+}
+
+#[test]
+fn the_bank_of_canadas_rates_arrive_in_the_background() {
+    let engine = engine();
+    let dir = tempfile::tempdir().unwrap();
+    ok(&engine, "money.invest.import", json!({"path": holdings_report(dir.path()), "accounts": []}));
+    assert_eq!(ok(&engine, "money.invest.summary", json!({"today": "2026-10-09"}))["holdings"][0]["fx_estimated"], true);
+
+    // A stand-in for curl that answers Valet's question the way the Bank of Canada does.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let curl = bin.join("curl");
+    std::fs::write(&curl, r#"#!/bin/sh
+case "$*" in
+  *https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json*)
+    echo '{"observations":[{"d":"2026-10-07","FXUSDCAD":{"v":"1.3712"}},{"d":"2026-10-08","FXUSDCAD":{"v":"1.3725"}}]}';;
+  *) echo "unexpected: $*" >&2; exit 22;;
+esac
+"#).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs = vec![bin.clone()];
+    dirs.extend(std::env::split_paths(&path));
+    std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+
+    let mut events = engine.subscribe();
+    let started = ok(&engine, "money.fx.fetch", json!({}));
+    std::env::set_var("PATH", path);
+    assert_eq!(started["started"], true);
+    let mut fetched = serde_json::Value::Null;
+    wait_until("the rates", || {
+        while let Ok(event) = events.try_recv() {
+            if event.ev == "money.changed" && event.payload.get("fx").is_some() {
+                fetched = event.payload;
+            }
+        }
+        !fetched.is_null()
+    });
+    assert_eq!(fetched, json!({"fx": 2}));
+    // The newest rate on or before today values Apple's US dollars: 1,000.00 USD at 1.3725.
+    let apple = &ok(&engine, "money.invest.summary", json!({"today": "2026-10-09"}))["holdings"][0];
+    assert_eq!((apple["symbol"].as_str(), apple["value"].as_i64(), apple["fx_estimated"].as_bool()), (Some("AAPL"), Some(137_250), Some(false)));
 }

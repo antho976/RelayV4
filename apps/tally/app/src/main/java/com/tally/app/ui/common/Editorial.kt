@@ -22,16 +22,23 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import com.tally.app.ui.theme.MonoAction
 import com.tally.app.ui.theme.MonoSectionAnchor
@@ -106,6 +113,49 @@ fun TextAction(label: String, onClick: () -> Unit, modifier: Modifier = Modifier
         contentAlignment = Alignment.Center,
     ) {
         Text("$label →", style = MaterialTheme.typography.labelLarge, color = color)
+    }
+}
+
+/** The hero figure stops growing here, as Avex's does, so a 200% font keeps a long amount on one line. */
+private const val HERO_MAX_SCALE = 1.3f
+
+/**
+ * THE serif figure of a screen. Its font scale is capped and it steps down a rung of the serif as
+ * the text grows, so a long amount at 200% stays on one line instead of breaking mid-number. The cap
+ * matters most below API 34, where font scaling is linear: 52sp at 2x is 104sp, wider than a phone.
+ */
+@Composable
+fun HeroNumber(
+    text: String,
+    modifier: Modifier = Modifier,
+    color: Color = MaterialTheme.colorScheme.onBackground,
+    description: String? = null,
+    live: Boolean = false,
+) {
+    val density = LocalDensity.current
+    val scale = density.fontScale.coerceAtMost(HERO_MAX_SCALE)
+    CompositionLocalProvider(LocalDensity provides Density(density.density, scale)) {
+        Text(
+            text,
+            style = heroStyle(text.length, scale),
+            color = color,
+            modifier = modifier.semantics {
+                if (description != null) contentDescription = description
+                if (live) liveRegion = LiveRegionMode.Polite
+            },
+        )
+    }
+}
+
+@Composable
+private fun heroStyle(length: Int, scale: Float): TextStyle {
+    val type = MaterialTheme.typography
+    val width = length * scale
+    return when {
+        width <= 9.5f -> type.displayLarge
+        width <= 12f -> type.displayMedium
+        width <= 15f -> type.headlineLarge
+        else -> type.headlineMedium
     }
 }
 

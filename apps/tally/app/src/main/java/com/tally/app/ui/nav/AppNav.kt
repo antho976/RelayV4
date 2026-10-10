@@ -3,6 +3,7 @@ package com.tally.app.ui.nav
 import androidx.lifecycle.Lifecycle
 import androidx.navigation.NavHostController
 import com.tally.core.CategoryKind
+import com.tally.core.Registration
 import com.tally.core.TxType
 
 /** Route strings. Arguments are optional query params so every screen has a "new" form. */
@@ -29,6 +30,10 @@ object Routes {
     const val PC = "settings/pc"
     const val IMPORT = "settings/import?source={source}"
     const val ABOUT = "settings/about"
+    /** The portfolio, pushed from Home's accounts, Insights' Worth and Accounts: a portfolio is not a month, so not a tab. */
+    const val INVESTMENTS = "investments"
+    /** This year's room for one registration; [Args.KIND] is its stored name ("TFSA"). */
+    const val ROOM_EDIT = "investments/room?kind={kind}"
 }
 
 /** Argument keys, read by ViewModels through SavedStateHandle. */
@@ -96,8 +101,27 @@ class AppNav(private val controller: NavHostController) {
     fun export() = go(Routes.EXPORT)
     fun pc() = go(Routes.PC)
     fun about() = go(Routes.ABOUT)
+    fun investments() = go(Routes.INVESTMENTS)
+    fun roomEdit(registration: Registration) = go("investments/room?kind=${registration.name}")
 
-    /** The bank import, opened on [source]'s directions ("desjardins", "wealthsimple", or none). */
+    /**
+     * The portfolio, asked for once an investment import is done. Opened from the portfolio, the
+     * import goes back to it; opened from anywhere else, the portfolio takes the import's place, so
+     * Back never lands on a finished import.
+     */
+    fun investmentsAfterImport() {
+        if (!resumed) return
+        if (controller.previousBackStackEntry?.destination?.route == Routes.INVESTMENTS) {
+            controller.popBackStack()
+        } else {
+            controller.navigate(Routes.INVESTMENTS) {
+                popUpTo(Routes.IMPORT) { inclusive = true }
+                launchSingleTop = true
+            }
+        }
+    }
+
+    /** The import, opened on [source]'s directions ("desjardins", "wealthsimple", "investments", or none). */
     fun import(source: String = "") = go("settings/import?source=$source")
 
     /**
